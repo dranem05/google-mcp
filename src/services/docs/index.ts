@@ -444,6 +444,52 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult({ success: true });
   });
 
+  server.tool("docs_insert_date", "Insert a real Google Docs date smart-chip (dateElement pill) at an index. The index must be inside an existing paragraph (not at a table start). Default display format is 'MMM d, y' (e.g. 'Jun 22, 2026').", {
+    documentId: z.string(),
+    index: z.number().describe("Character index to insert the date pill at; must be within an existing paragraph"),
+    timestamp: z.string().describe("Point in time as RFC3339 (e.g. '2026-06-22T12:00:00Z'). Interpreted in UTC unless timeZoneId is set."),
+    dateFormat: z.string().optional().describe("e.g. DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED (default), DATE_FORMAT_ISO8601"),
+    timeFormat: z.string().optional().describe("e.g. TIME_FORMAT_DISABLED (default), TIME_FORMAT_HOUR_MINUTE"),
+    timeZoneId: z.string().optional().describe("IANA tz, e.g. 'America/New_York'. Defaults to etc/UTC."),
+    locale: z.string().optional().describe("CLDR locale, e.g. 'en_US'"),
+  }, async ({ documentId, index, timestamp, dateFormat, timeFormat, timeZoneId, locale }) => {
+    const dateElementProperties: docs_v1.Schema$DateElementProperties = { timestamp };
+    if (dateFormat) dateElementProperties.dateFormat = dateFormat;
+    if (timeFormat) dateElementProperties.timeFormat = timeFormat;
+    if (timeZoneId) dateElementProperties.timeZoneId = timeZoneId;
+    if (locale) dateElementProperties.locale = locale;
+    await docsApi().documents.batchUpdate({
+      documentId,
+      requestBody: { requests: [{ insertDate: { location: { index }, dateElementProperties } }] },
+    });
+    return textResult({ success: true, index, timestamp });
+  });
+
+  server.tool("docs_create_paragraph_bullets", "Apply a bullet list to a range. Nesting level is set deterministically by LEADING TABS on each paragraph (0 tabs = top level, 1 tab = one level deeper, etc.); the tabs are consumed. Use this for reliable heading(L0)/content(L1) nesting instead of relying on insert-time list inheritance.", {
+    documentId: z.string(),
+    startIndex: z.number(),
+    endIndex: z.number(),
+    bulletPreset: z.string().optional().default("BULLET_DISC_CIRCLE_SQUARE").describe("Glyph preset, e.g. BULLET_DISC_CIRCLE_SQUARE, BULLET_CHECKBOX, NUMBERED_DECIMAL_ALPHA_ROMAN"),
+  }, async ({ documentId, startIndex, endIndex, bulletPreset }) => {
+    await docsApi().documents.batchUpdate({
+      documentId,
+      requestBody: { requests: [{ createParagraphBullets: { range: { startIndex, endIndex }, bulletPreset } }] },
+    });
+    return textResult({ success: true });
+  });
+
+  server.tool("docs_delete_paragraph_bullets", "Remove bullets/numbering from the paragraphs in a range (the paragraphs and their text remain; only the list formatting is stripped).", {
+    documentId: z.string(),
+    startIndex: z.number(),
+    endIndex: z.number(),
+  }, async ({ documentId, startIndex, endIndex }) => {
+    await docsApi().documents.batchUpdate({
+      documentId,
+      requestBody: { requests: [{ deleteParagraphBullets: { range: { startIndex, endIndex } } }] },
+    });
+    return textResult({ success: true });
+  });
+
   server.tool("docs_copy_formatting", "Copy formatting from a source range to a target range", {
     documentId: z.string(),
     sourceStartIndex: z.number(),
