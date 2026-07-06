@@ -3,18 +3,29 @@ import { google } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult, mimeShortcut } from "../../utils/formatting.js";
+import { escapeDriveQueryValue } from "../../utils/drive-query.js";
+import { decodeCompositePageToken, encodeCompositePageToken } from "../../utils/pagination.js";
 
 import { drive_v3 } from "googleapis";
-import { mkdir, writeFile, readdir, stat, unlink } from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { writeFile, stat, unlink } from "node:fs/promises";
+import { createWriteStream, createReadStream } from "node:fs";
+import { basename, extname } from "node:path";
 import { pipeline } from "node:stream/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { randomBytes } from "node:crypto";
 import type { Readable } from "node:stream";
+import { ensureCacheInitialized, maybePeriodicSweep, cachePath } from "../../utils/download-cache.js";
 
-const DOWNLOAD_CACHE_DIR = join(tmpdir(), "google-mcp");
-const DOWNLOAD_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+// Minimal extension -> MIME map for uploads when the caller doesn't specify one.
+const UPLOAD_EXT_TO_MIME: Record<string, string> = {
+  ".txt": "text/plain", ".md": "text/markdown", ".csv": "text/csv", ".html": "text/html",
+  ".json": "application/json", ".xml": "application/xml", ".pdf": "application/pdf",
+  ".zip": "application/zip", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+  ".gif": "image/gif", ".svg": "image/svg+xml", ".mp4": "video/mp4", ".mp3": "audio/mpeg",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+};
+
 // Hard cap for inline (returnContent=true) downloads to keep tool responses
 // from blowing past MCP/LLM context budgets and to avoid OOM. Callers that
 // need larger payloads should use the default disk mode.
@@ -50,59 +61,6 @@ function isTextMime(mime: string): boolean {
   return /\+(?:json|xml|yaml)$/.test(mime);
 }
 
-// Sweeps the cache dir of files older than DOWNLOAD_CACHE_TTL_MS.
-// Used both on first download per process (to handle a freshly started
-// server inheriting a stale cache dir) and periodically thereafter (to
-// keep long-running processes from accumulating downloads).
-async function sweepStaleDownloads(): Promise<void> {
-  const entries = await readdir(DOWNLOAD_CACHE_DIR);
-  const cutoff = Date.now() - DOWNLOAD_CACHE_TTL_MS;
-  // Sequential sweep keeps file-descriptor and IO pressure bounded even
-  // when the cache dir has accumulated many entries.
-  for (const entry of entries) {
-    const path = join(DOWNLOAD_CACHE_DIR, entry);
-    try {
-      const s = await stat(path);
-      if (s.isFile() && s.mtimeMs < cutoff) await unlink(path);
-    } catch {
-      // Entry was removed concurrently or otherwise inaccessible. Ignore.
-    }
-  }
-}
-
-// One-shot initialization of the cache dir: ensures the directory exists
-// and runs an initial sweep. Subsequent downloads re-run the sweep at most
-// once per DOWNLOAD_CACHE_TTL_MS interval (lastSweepAt), so a long-running
-// process doesn't get stuck on the first sweep forever. If init fails, the
-// cached promise is cleared so the next call can retry. Per-entry cleanup
-// errors are swallowed inside sweepStaleDownloads, but a top-level
-// mkdir/readdir failure rejects and resets so callers see the real error
-// and the next call gets a fresh attempt.
-let cacheInitPromise: Promise<void> | null = null;
-let lastSweepAt = 0;
-function ensureCacheInitialized(): Promise<void> {
-  if (cacheInitPromise) return cacheInitPromise;
-  cacheInitPromise = (async () => {
-    await mkdir(DOWNLOAD_CACHE_DIR, { recursive: true });
-    await sweepStaleDownloads();
-    lastSweepAt = Date.now();
-  })().catch((err) => {
-    cacheInitPromise = null;
-    throw err;
-  });
-  return cacheInitPromise;
-}
-
-// Run an additional sweep if more than DOWNLOAD_CACHE_TTL_MS has passed
-// since the last one. Fire-and-forget so it never blocks a download.
-function maybePeriodicSweep(): void {
-  if (Date.now() - lastSweepAt < DOWNLOAD_CACHE_TTL_MS) return;
-  lastSweepAt = Date.now(); // optimistic: prevents concurrent re-entry
-  sweepStaleDownloads().catch(() => {
-    // Best-effort; an error here is non-fatal for downloads.
-  });
-}
-
 const MIME_TO_EXT: Record<string, string> = {
   "text/markdown": "md",
   "text/plain": "txt",
@@ -122,25 +80,26 @@ function extensionFor(mime: string | null | undefined): string {
   return MIME_TO_EXT[mime] || mime.split("/").pop()?.split(".").pop() || "bin";
 }
 
-function safeFileName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
-}
+// Field mask shared by the Drive `list` calls below and by
+// formatFileForList: list-style responses are pruned down to the minimum
+// useful set (owner display name and webViewLink cost real tokens across
+// dozens/hundreds of list rows and are rarely needed until a caller drills
+// into one specific file).
+const LIST_FIELD_MASK = "id,name,mimeType,modifiedTime,size,parents";
 
-function formatFile(f: drive_v3.Schema$File): Record<string, unknown> {
+export function formatFileForList(f: drive_v3.Schema$File): Record<string, unknown> {
   return {
     id: f.id,
     name: f.name,
     mimeType: f.mimeType,
-    size: f.size,
     modifiedTime: f.modifiedTime,
-    createdTime: f.createdTime,
-    owner: f.owners?.[0]?.displayName,
-    url: f.webViewLink,
+    size: f.size,
+    parents: f.parents,
   };
 }
 
 export function registerDriveTools(server: McpServer, ctx: ServiceContext): void {
-  const api = () => google.drive({ version: "v3", auth: ctx.auth });
+  const api = google.drive({ version: "v3", auth: ctx.auth });
 
   server.tool("drive_list_files", "List files in Drive with optional filtering", {
     folderId: z.string().optional().describe("Folder ID to list. Use 'root' for top-level."),
@@ -150,23 +109,30 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     sortDirection: z.enum(["asc", "desc"]).optional().default("desc"),
     ownedByMe: z.boolean().optional(),
     modifiedAfter: z.string().optional().describe("ISO 8601 date filter"),
-  }, async ({ folderId, mimeType, maxResults, orderBy, sortDirection, ownedByMe, modifiedAfter }) => {
+    pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
+  }, async ({ folderId, mimeType, maxResults, orderBy, sortDirection, ownedByMe, modifiedAfter, pageToken }) => {
     const qParts: string[] = ["trashed = false"];
-    if (folderId) qParts.push(`'${folderId}' in parents`);
-    if (mimeType) qParts.push(`mimeType = '${mimeShortcut(mimeType)}'`);
+    if (folderId) qParts.push(`'${escapeDriveQueryValue(folderId)}' in parents`);
+    if (mimeType) qParts.push(`mimeType = '${escapeDriveQueryValue(mimeShortcut(mimeType))}'`);
     if (ownedByMe) qParts.push("'me' in owners");
-    if (modifiedAfter) qParts.push(`modifiedTime > '${modifiedAfter}'`);
+    if (modifiedAfter) qParts.push(`modifiedTime > '${escapeDriveQueryValue(modifiedAfter)}'`);
 
     const order = `${orderBy} ${sortDirection === "asc" ? "" : "desc"}`.trim();
-    const res = await api().files.list({
+    const res = await api.files.list({
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
       q: qParts.join(" and "),
       pageSize: maxResults,
+      pageToken,
       orderBy: order,
-      fields: "files(id,name,mimeType,size,modifiedTime,createdTime,owners,webViewLink)",
+      fields: `nextPageToken,files(${LIST_FIELD_MASK})`,
     });
-    return textResult(res.data.files?.map(formatFile) || []);
+    return textResult({
+      files: res.data.files?.map(formatFileForList) || [],
+      total: res.data.files?.length || 0,
+      hasMore: !!res.data.nextPageToken,
+      nextPageToken: res.data.nextPageToken,
+    });
   });
 
   server.tool("drive_list_folder_contents", "List files and subfolders in a Drive folder", {
@@ -174,36 +140,47 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     includeFiles: z.boolean().optional().default(true),
     includeSubfolders: z.boolean().optional().default(true),
     maxResults: z.number().optional().default(50),
-  }, async ({ folderId, includeFiles, includeSubfolders, maxResults }) => {
-    const drive = api();
-    const folders: unknown[] = [];
-    const files: unknown[] = [];
+    pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
+  }, async ({ folderId, includeFiles, includeSubfolders, maxResults, pageToken }) => {
+    const drive = api;
+    const { folders: folderToken, files: fileToken } = decodeCompositePageToken(pageToken);
 
-    if (includeSubfolders) {
-      const fRes = await drive.files.list({
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-        q: `'${folderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
-        pageSize: maxResults,
-        orderBy: "name",
-        fields: "files(id,name,modifiedTime)",
-      });
-      folders.push(...(fRes.data.files || []));
-    }
+    // The folder and file listings are two independent Drive queries with no
+    // data dependency between them — run them concurrently instead of
+    // serially awaiting one after the other.
+    const [folderRes, fileRes] = await Promise.all([
+      includeSubfolders
+        ? drive.files.list({
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true,
+            q: `'${escapeDriveQueryValue(folderId)}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+            pageSize: maxResults,
+            pageToken: folderToken,
+            orderBy: "name",
+            fields: `nextPageToken,files(${LIST_FIELD_MASK})`,
+          })
+        : undefined,
+      includeFiles
+        ? drive.files.list({
+            supportsAllDrives: true,
+            includeItemsFromAllDrives: true,
+            q: `'${escapeDriveQueryValue(folderId)}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false`,
+            pageSize: maxResults,
+            pageToken: fileToken,
+            orderBy: "name",
+            fields: `nextPageToken,files(${LIST_FIELD_MASK})`,
+          })
+        : undefined,
+    ]);
 
-    if (includeFiles) {
-      const fRes = await drive.files.list({
-        supportsAllDrives: true,
-        includeItemsFromAllDrives: true,
-        q: `'${folderId}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false`,
-        pageSize: maxResults,
-        orderBy: "name",
-        fields: "files(id,name,mimeType,modifiedTime)",
-      });
-      files.push(...(fRes.data.files || []));
-    }
+    const folders = (folderRes?.data.files || []).map(formatFileForList);
+    const files = (fileRes?.data.files || []).map(formatFileForList);
+    const nextPageToken = encodeCompositePageToken({
+      folders: folderRes?.data.nextPageToken ?? undefined,
+      files: fileRes?.data.nextPageToken ?? undefined,
+    });
 
-    return textResult({ folders, files });
+    return textResult({ folders, files, nextPageToken });
   });
 
   server.tool("drive_search_files", "Search Drive by name or content", {
@@ -218,25 +195,26 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     pageToken: z.string().optional(),
   }, async ({ query, searchIn, folderId, mimeType, maxResults, orderBy, sortDirection, modifiedAfter, pageToken }) => {
     const qParts: string[] = ["trashed = false"];
-    if (searchIn === "name") qParts.push(`name contains '${query}'`);
-    else if (searchIn === "content") qParts.push(`fullText contains '${query}'`);
-    else qParts.push(`(name contains '${query}' or fullText contains '${query}')`);
-    if (folderId) qParts.push(`'${folderId}' in parents`);
-    if (mimeType) qParts.push(`mimeType = '${mimeShortcut(mimeType)}'`);
-    if (modifiedAfter) qParts.push(`modifiedTime > '${modifiedAfter}'`);
+    const escapedQuery = escapeDriveQueryValue(query);
+    if (searchIn === "name") qParts.push(`name contains '${escapedQuery}'`);
+    else if (searchIn === "content") qParts.push(`fullText contains '${escapedQuery}'`);
+    else qParts.push(`(name contains '${escapedQuery}' or fullText contains '${escapedQuery}')`);
+    if (folderId) qParts.push(`'${escapeDriveQueryValue(folderId)}' in parents`);
+    if (mimeType) qParts.push(`mimeType = '${escapeDriveQueryValue(mimeShortcut(mimeType))}'`);
+    if (modifiedAfter) qParts.push(`modifiedTime > '${escapeDriveQueryValue(modifiedAfter)}'`);
 
-    const res = await api().files.list({
+    const res = await api.files.list({
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
       q: qParts.join(" and "),
       pageSize: maxResults,
       pageToken,
       orderBy: `${orderBy} ${sortDirection === "asc" ? "" : "desc"}`.trim(),
-      fields: "nextPageToken,files(id,name,mimeType,size,modifiedTime,createdTime,owners,webViewLink)",
+      fields: `nextPageToken,files(${LIST_FIELD_MASK})`,
     });
 
     return textResult({
-      files: res.data.files?.map(formatFile) || [],
+      files: res.data.files?.map(formatFileForList) || [],
       total: res.data.files?.length || 0,
       hasMore: !!res.data.nextPageToken,
       nextPageToken: res.data.nextPageToken,
@@ -248,7 +226,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     newParentId: z.string().describe("Destination folder ID. Use 'root' for top-level."),
     removeFromAllParents: z.boolean().optional().default(false).describe("Remove the file from all current parents. Always treated as true for Shared Drive items, which can only have one parent."),
   }, async ({ fileId, newParentId, removeFromAllParents }) => {
-    const drive = api();
+    const drive = api;
     // Always fetch parents + driveId. Shared Drive items can only have one
     // parent, so adding a new parent without removing the existing one
     // will fail. Force-remove existing parents on Shared Drive items.
@@ -277,7 +255,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     name: z.string().optional().describe("Name for the copy"),
     parentId: z.string().optional().describe("Destination folder ID"),
   }, async ({ fileId, name, parentId }) => {
-    const res = await api().files.copy({
+    const res = await api.files.copy({
       supportsAllDrives: true,
       fileId,
       requestBody: { name, parents: parentId ? [parentId] : undefined },
@@ -290,7 +268,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     fileId: z.string(),
     newName: z.string(),
   }, async ({ fileId, newName }) => {
-    const res = await api().files.update({ supportsAllDrives: true, fileId, requestBody: { name: newName }, fields: "id,name" });
+    const res = await api.files.update({ supportsAllDrives: true, fileId, requestBody: { name: newName }, fields: "id,name" });
     return textResult({ id: res.data.id, name: res.data.name });
   });
 
@@ -298,7 +276,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     fileId: z.string(),
     permanent: z.boolean().optional().default(false),
   }, async ({ fileId, permanent }) => {
-    const drive = api();
+    const drive = api;
     if (permanent) {
       await drive.files.delete({ supportsAllDrives: true, fileId });
       return textResult({ success: true, action: "deleted", fileId });
@@ -313,7 +291,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     mimeType: z.string().optional().describe("Export MIME type for Google Workspace files (e.g., 'text/markdown', 'text/plain', 'application/pdf')"),
     returnContent: z.boolean().optional().default(false).describe("If true, return the file content inline (utf-8 for text MIME, base64 otherwise) instead of writing to disk. Default false: write to disk and return a path."),
   }, async ({ fileId, mimeType, returnContent }) => {
-    const drive = api();
+    const drive = api;
     const meta = await drive.files.get({
       supportsAllDrives: true,
       fileId,
@@ -382,9 +360,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     maybePeriodicSweep();
 
     const ext = extensionFor(outMime);
-    const safeName = safeFileName(meta.data.name || fileId);
-    const suffix = randomBytes(4).toString("hex");
-    const path = join(DOWNLOAD_CACHE_DIR, `${safeName}-${Date.now()}-${suffix}.${ext}`);
+    const path = cachePath(meta.data.name || fileId, ext);
 
     let bytes: number;
     try {
@@ -426,7 +402,7 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
     name: z.string(),
     parentId: z.string().optional().describe("Parent folder ID"),
   }, async ({ name, parentId }) => {
-    const res = await api().files.create({
+    const res = await api.files.create({
       supportsAllDrives: true,
       requestBody: {
         name,
@@ -441,15 +417,102 @@ export function registerDriveTools(server: McpServer, ctx: ServiceContext): void
   server.tool("drive_get_folder_info", "Get folder metadata and size", {
     folderId: z.string(),
   }, async ({ folderId }) => {
-    const drive = api();
+    const drive = api;
     const meta = await drive.files.get({ supportsAllDrives: true, fileId: folderId, fields: "id,name,modifiedTime,createdTime,owners,webViewLink" });
     const children = await drive.files.list({
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
-      q: `'${folderId}' in parents and trashed = false`,
+      q: `'${escapeDriveQueryValue(folderId)}' in parents and trashed = false`,
       fields: "files(id)",
       pageSize: 1000,
     });
     return textResult({ ...meta.data, childCount: children.data.files?.length || 0 });
+  });
+
+  server.tool("drive_upload_file", "Upload a local file into Google Drive. Reads from local_path (must exist) and creates a new Drive file. Defaults: name = the file's basename, mime_type = guessed from the extension, destination = My Drive root (pass folder_id to place it in a folder). Large files are uploaded resumably by the SDK.", {
+    local_path: z.string().describe("Path to the local file to upload"),
+    folder_id: z.string().optional().describe("Destination folder ID. Omit for My Drive root."),
+    name: z.string().optional().describe("Name for the Drive file. Defaults to the local file's basename."),
+    mime_type: z.string().optional().describe("MIME type. Guessed from the file extension if omitted."),
+  }, async ({ local_path, folder_id, name, mime_type }) => {
+    // Fail fast with a clean error if the path doesn't exist or isn't a file,
+    // instead of letting a lazy read stream reject opaquely mid-upload.
+    let fileStat;
+    try {
+      fileStat = await stat(local_path);
+    } catch {
+      throw new Error(`Local file not found: ${local_path}`);
+    }
+    if (!fileStat.isFile()) {
+      throw new Error(`Not a regular file: ${local_path}`);
+    }
+
+    const fileName = name || basename(local_path);
+    const mimeType = mime_type || UPLOAD_EXT_TO_MIME[extname(local_path).toLowerCase()] || "application/octet-stream";
+
+    const res = await api.files.create({
+      supportsAllDrives: true,
+      requestBody: {
+        name: fileName,
+        parents: folder_id ? [folder_id] : undefined,
+      },
+      media: {
+        mimeType,
+        body: createReadStream(local_path),
+      },
+      fields: "id,name,mimeType,size,parents,webViewLink",
+    });
+    return textResult({
+      id: res.data.id,
+      name: res.data.name,
+      mimeType: res.data.mimeType,
+      size: res.data.size,
+      url: res.data.webViewLink,
+    });
+  });
+
+  server.tool("drive_share", "Share a Drive file (grant a permission). For a specific person or group use type='user'/'group' with an email; type='domain' with a domain; type='anyone' for a public link. Does NOT email the recipient by default (set sendNotificationEmail=true to notify).", {
+    fileId: z.string(),
+    role: z.enum(["reader", "commenter", "writer", "fileOrganizer", "organizer", "owner"]).describe("Access level to grant"),
+    type: z.enum(["user", "group", "domain", "anyone"]).describe("Grantee type"),
+    email: z.string().optional().describe("Email address for type=user or type=group"),
+    domain: z.string().optional().describe("Domain for type=domain"),
+    sendNotificationEmail: z.boolean().optional().default(false).describe("Whether to email the grantee. Default false."),
+    emailMessage: z.string().optional().describe("Custom message to include when sendNotificationEmail is true"),
+    allowFileDiscovery: z.boolean().optional().describe("For type=domain/anyone: whether the file surfaces in search. Default (unset) is a link-only share."),
+  }, async ({ fileId, role, type, email, domain, sendNotificationEmail, emailMessage, allowFileDiscovery }) => {
+    if ((type === "user" || type === "group") && !email) {
+      throw new Error(`type='${type}' requires an email address.`);
+    }
+    if (type === "domain" && !domain) {
+      throw new Error("type='domain' requires a domain.");
+    }
+    const permission: drive_v3.Schema$Permission = { role, type };
+    if (email) permission.emailAddress = email;
+    if (domain) permission.domain = domain;
+    if (allowFileDiscovery !== undefined) permission.allowFileDiscovery = allowFileDiscovery;
+
+    const res = await api.permissions.create({
+      supportsAllDrives: true,
+      fileId,
+      sendNotificationEmail,
+      emailMessage,
+      requestBody: permission,
+      fields: "id,type,role,emailAddress,domain,allowFileDiscovery",
+    });
+    return textResult(res.data);
+  });
+
+  server.tool("drive_list_permissions", "List who has access to a Drive file (its permissions).", {
+    fileId: z.string(),
+    pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
+  }, async ({ fileId, pageToken }) => {
+    const res = await api.permissions.list({
+      supportsAllDrives: true,
+      fileId,
+      pageToken,
+      fields: "nextPageToken,permissions(id,type,role,emailAddress,domain,displayName,allowFileDiscovery)",
+    });
+    return textResult({ permissions: res.data.permissions || [], nextPageToken: res.data.nextPageToken });
   });
 }

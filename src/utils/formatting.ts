@@ -1,5 +1,8 @@
+// Compact (no pretty-print indent): tool responses are consumed by the
+// model, not a human reading a terminal, and the `null, 2` indentation was
+// spending real context-window tokens on whitespace with no benefit.
 export function textResult(data: unknown): { content: Array<{ type: "text"; text: string }> } {
-  const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+  const text = typeof data === "string" ? data : JSON.stringify(data);
   return { content: [{ type: "text" as const, text }] };
 }
 

@@ -1,8 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { google, docs_v1 } from "googleapis";
+import { google, docs_v1, drive_v3 } from "googleapis";
 import { z } from "zod";
 import { ServiceContext } from "../../types.js";
 import { textResult } from "../../utils/formatting.js";
+import { concatMarkdownForAppend } from "./markdown.js";
 
 function extractPlainText(body: docs_v1.Schema$Body | undefined): string {
   if (!body?.content) return "";
@@ -25,64 +26,171 @@ function extractPlainText(body: docs_v1.Schema$Body | undefined): string {
   return text;
 }
 
-function extractMarkdown(body: docs_v1.Schema$Body | undefined): string {
-  if (!body?.content) return "";
-  let md = "";
-  for (const el of body.content) {
-    if (el.paragraph) {
-      const style = el.paragraph.paragraphStyle?.namedStyleType;
-      let prefix = "";
-      if (style === "HEADING_1") prefix = "# ";
-      else if (style === "HEADING_2") prefix = "## ";
-      else if (style === "HEADING_3") prefix = "### ";
-      else if (style === "HEADING_4") prefix = "#### ";
-      else if (style === "HEADING_5") prefix = "##### ";
-      else if (style === "HEADING_6") prefix = "###### ";
-
-      let line = "";
-      for (const pe of el.paragraph.elements || []) {
-        if (pe.textRun) {
-          let t = pe.textRun.content || "";
-          const ts = pe.textRun.textStyle;
-          if (ts?.bold) t = `**${t.trim()}** `;
-          if (ts?.italic) t = `*${t.trim()}* `;
-          if (ts?.link?.url) t = `[${t.trim()}](${ts.link.url})`;
-          line += t;
-        }
-      }
-      md += prefix + line;
-      if (!line.endsWith("\n")) md += "\n";
-    }
-  }
-  return md;
+/**
+ * Locates the table created by an insertTable request at `location: {index}`.
+ * Per the Docs API (Schema$InsertTableRequest.location): "A newline character
+ * will be inserted before the inserted table, therefore the table start
+ * index will be at the specified location index + 1." Returns undefined when
+ * no table sits at that position — callers must treat that as an error, not
+ * fall back to some other table.
+ */
+export function findInsertedTable(
+  content: docs_v1.Schema$StructuralElement[] | undefined,
+  insertionIndex: number
+): docs_v1.Schema$Table | undefined {
+  return content?.find((e) => e.table && e.startIndex === insertionIndex + 1)?.table ?? undefined;
 }
 
-export function registerDocsTools(server: McpServer, ctx: ServiceContext): void {
-  const docsApi = () => google.docs({ version: "v1", auth: ctx.auth });
-  const driveApi = () => google.drive({ version: "v3", auth: ctx.auth });
+interface TabStructureSummary {
+  tabId: string | undefined;
+  title: string | undefined;
+  paragraphs: number;
+  tables: number;
+  images: number;
+}
 
-  server.tool("docs_read_document", "Read the content of a Google Document", {
+function countBodyElements(body: docs_v1.Schema$Body | undefined): { paragraphs: number; tables: number; images: number } {
+  let paragraphs = 0;
+  let tables = 0;
+  let images = 0;
+  for (const el of body?.content || []) {
+    if (el.paragraph) {
+      paragraphs++;
+      for (const pe of el.paragraph.elements || []) {
+        if (pe.inlineObjectElement) images++;
+      }
+    }
+    if (el.table) tables++;
+  }
+  return { paragraphs, tables, images };
+}
+
+function collectTabSummaries(tabs: docs_v1.Schema$Tab[] | undefined): TabStructureSummary[] {
+  const out: TabStructureSummary[] = [];
+  for (const tab of tabs || []) {
+    out.push({
+      tabId: tab.tabProperties?.tabId ?? undefined,
+      title: tab.tabProperties?.title ?? undefined,
+      ...countBodyElements(tab.documentTab?.body),
+    });
+    out.push(...collectTabSummaries(tab.childTabs));
+  }
+  return out;
+}
+
+/**
+ * Builds a small structural summary of a document (title/tabs/element
+ * counts) in place of the full JSON body — used by docs_read_document when
+ * the full JSON would blow past the size cap.
+ */
+export function summarizeDocumentStructure(doc: docs_v1.Schema$Document): {
+  documentId: string | undefined;
+  title: string | undefined;
+  revisionId: string | undefined;
+  tabCount: number;
+  tabs: TabStructureSummary[];
+} {
+  const tabs = doc.tabs?.length
+    ? collectTabSummaries(doc.tabs)
+    : [{ tabId: undefined, title: doc.title ?? undefined, ...countBodyElements(doc.body) }];
+
+  return {
+    documentId: doc.documentId ?? undefined,
+    title: doc.title ?? undefined,
+    revisionId: doc.revisionId ?? undefined,
+    tabCount: tabs.length,
+    tabs,
+  };
+}
+
+function findTab(tabs: docs_v1.Schema$Tab[] | undefined, tabId: string): docs_v1.Schema$Tab | undefined {
+  for (const tab of tabs || []) {
+    if (tab.tabProperties?.tabId === tabId) return tab;
+    const found = findTab(tab.childTabs, tabId);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
+ * Picks which tab's body to read. Requires includeTabsContent: true on the
+ * documents.get call, since that's what populates tab.documentTab.body
+ * (without it, tabs only carry tabProperties, not content).
+ */
+function selectTabBody(doc: docs_v1.Schema$Document, tabId: string | undefined): docs_v1.Schema$Body | undefined {
+  const tabs = doc.tabs;
+  if (!tabs?.length) return doc.body;
+  if (tabId) {
+    const tab = findTab(tabs, tabId);
+    if (tab?.documentTab?.body) return tab.documentTab.body;
+  }
+  return tabs[0]?.documentTab?.body;
+}
+
+// Default cap on docs_read_document output (all formats) so a large document
+// can't blow past the model's context budget. Callers can raise it via the
+// maxLength param when they genuinely need more.
+const DEFAULT_MAX_LENGTH = 50_000;
+
+export function registerDocsTools(server: McpServer, ctx: ServiceContext): void {
+  const docsApi = google.docs({ version: "v1", auth: ctx.auth });
+  const driveApi = google.drive({ version: "v3", auth: ctx.auth });
+
+  server.tool("docs_read_document", "Read the content of a Google Document. format 'markdown' returns Google Drive's own native markdown export (full-fidelity headings, bold/italic, links, lists, tables) — not a lossy reconstruction. Note: markdown exports the WHOLE document; the tabId filter only applies to 'text'/'json'.", {
     documentId: z.string().describe("Document ID from the URL"),
     format: z.enum(["text", "markdown", "json"]).optional().default("text"),
-    maxLength: z.number().optional(),
-    tabId: z.string().optional(),
-  }, async ({ documentId, format, maxLength }) => {
-    const doc = await docsApi().documents.get({ documentId });
-    let content: string;
-    if (format === "json") return textResult(doc.data);
-    if (format === "markdown") content = extractMarkdown(doc.data.body);
-    else content = extractPlainText(doc.data.body);
-    if (maxLength && content.length > maxLength) content = content.slice(0, maxLength);
-    return textResult(`Content (${content.length} characters):\n${content}`);
+    maxLength: z.number().optional().describe(`Max characters (text/markdown) or JSON-string length (json) to return before capping. Defaults to ${DEFAULT_MAX_LENGTH}.`),
+    tabId: z.string().optional().describe("Read only this tab's content (see docs_list_tabs for tab IDs). Defaults to the document's first tab. Ignored for format 'markdown' (Drive exports the whole document)."),
+  }, async ({ documentId, format, maxLength, tabId }) => {
+    const cap = maxLength ?? DEFAULT_MAX_LENGTH;
+
+    // Markdown uses Drive's native Docs->markdown converter for full fidelity,
+    // rather than reconstructing markdown from the Docs JSON. Drive exports the
+    // whole document (no per-tab export), so tabId is not honored here.
+    if (format === "markdown") {
+      const res = await driveApi.files.export(
+        { fileId: documentId, mimeType: "text/markdown" },
+        { responseType: "text" }
+      );
+      const content = typeof res.data === "string" ? res.data : String(res.data);
+      const totalLength = content.length;
+      const truncated = totalLength > cap;
+      const shown = truncated ? content.slice(0, cap) : content;
+      const header = truncated
+        ? `Content (showing first ${cap} of ${totalLength} characters; pass a larger maxLength to see more):`
+        : `Content (${totalLength} characters):`;
+      return textResult(`${header}\n${shown}`);
+    }
+
+    const doc = await docsApi.documents.get({ documentId, includeTabsContent: true });
+
+    if (format === "json") {
+      const json = JSON.stringify(doc.data);
+      if (json.length <= cap) return textResult(doc.data);
+      return textResult({
+        note: `Document JSON is ${json.length} characters, exceeding the ${cap}-character cap (maxLength). Returning a structural summary instead — use format: "text" or "markdown" for readable content, or pass a larger maxLength to force the full JSON.`,
+        structure: summarizeDocumentStructure(doc.data),
+      });
+    }
+
+    const body = selectTabBody(doc.data, tabId);
+    const content = extractPlainText(body);
+    const totalLength = content.length;
+    const truncated = totalLength > cap;
+    const shown = truncated ? content.slice(0, cap) : content;
+    const header = truncated
+      ? `Content (showing first ${cap} of ${totalLength} characters; pass a larger maxLength to see more):`
+      : `Content (${totalLength} characters):`;
+    return textResult(`${header}\n${shown}`);
   });
 
   server.tool("docs_create_document", "Create a new Google Document", {
     title: z.string(),
     parentFolderId: z.string().optional(),
   }, async ({ title, parentFolderId }) => {
-    const doc = await docsApi().documents.create({ requestBody: { title } });
+    const doc = await docsApi.documents.create({ requestBody: { title } });
     if (parentFolderId && doc.data.documentId) {
-      await driveApi().files.update({ fileId: doc.data.documentId, addParents: parentFolderId, fields: "id" });
+      await driveApi.files.update({ fileId: doc.data.documentId, addParents: parentFolderId, fields: "id" });
     }
     return textResult({ documentId: doc.data.documentId, title: doc.data.title, url: `https://docs.google.com/document/d/${doc.data.documentId}/edit` });
   });
@@ -92,7 +200,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     title: z.string(),
     parentFolderId: z.string().optional(),
   }, async ({ templateDocumentId, title, parentFolderId }) => {
-    const copy = await driveApi().files.copy({
+    const copy = await driveApi.files.copy({
       fileId: templateDocumentId,
       requestBody: { name: title, parents: parentFolderId ? [parentFolderId] : undefined },
       fields: "id,name,webViewLink",
@@ -103,7 +211,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
   server.tool("docs_get_info", "Get document metadata", {
     documentId: z.string(),
   }, async ({ documentId }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     return textResult({
       documentId: doc.data.documentId,
       title: doc.data.title,
@@ -117,7 +225,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     text: z.string(),
     index: z.number().describe("Character index to insert at (1 = start of body)"),
   }, async ({ documentId, text, index }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertText: { text, location: { index } } }] },
     });
@@ -128,26 +236,30 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     text: z.string(),
   }, async ({ documentId, text }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId, fields: "body.content(endIndex)" });
     const endIndex = (doc.data.body?.content?.at(-1)?.endIndex || 2) - 1;
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertText: { text, location: { index: endIndex } } }] },
     });
     return textResult({ success: true, appendedAt: endIndex });
   });
 
-  server.tool("docs_append_markdown", "Append markdown-formatted text to the document", {
+  server.tool("docs_append_markdown", "Append markdown to the end of a document, rendered as NATIVE Google Docs content (real headings, bold/italic, links, lists, tables) via Drive's markdown converter. Works by exporting the current doc to markdown, concatenating your markdown, and re-importing the whole thing. CAVEAT: because this rewrites the entire document, comments, suggestions, and named anchors/bookmarks in the existing content are NOT preserved. For surgical edits that keep those, use docs_insert_text / docs_apply_* instead.", {
     documentId: z.string(),
     markdown: z.string(),
   }, async ({ documentId, markdown }) => {
-    const doc = await docsApi().documents.get({ documentId });
-    const endIndex = (doc.data.body?.content?.at(-1)?.endIndex || 2) - 1;
-    await docsApi().documents.batchUpdate({
-      documentId,
-      requestBody: { requests: [{ insertText: { text: markdown, location: { index: endIndex } } }] },
+    const exported = await driveApi.files.export(
+      { fileId: documentId, mimeType: "text/markdown" },
+      { responseType: "text" }
+    );
+    const existing = typeof exported.data === "string" ? exported.data : String(exported.data);
+    const combined = concatMarkdownForAppend(existing, markdown);
+    await driveApi.files.update({
+      fileId: documentId,
+      media: { mimeType: "text/markdown", body: combined },
     });
-    return textResult({ success: true, appendedAt: endIndex, note: "Inserted as plain text; markdown rendering depends on the viewer." });
+    return textResult({ success: true, note: "Appended as native Docs content. Full-document re-import: comments/anchors in existing content may not survive." });
   });
 
   server.tool("docs_modify_text", "Replace text in a range", {
@@ -156,7 +268,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     endIndex: z.number(),
     newText: z.string(),
   }, async ({ documentId, startIndex, endIndex, newText }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: {
         requests: [
@@ -168,19 +280,15 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult({ success: true });
   });
 
-  server.tool("docs_replace_with_markdown", "Replace the entire document body with markdown content", {
+  server.tool("docs_replace_with_markdown", "Replace the ENTIRE document with markdown, rendered as native Google Docs content (real headings, bold/italic, links, lists, tables) via Drive's markdown converter — not plain text. This overwrites all existing content. CAVEAT: because it re-imports the whole file, existing comments, suggestions, and named anchors/bookmarks are NOT preserved. Best for generating a document from scratch or wholesale rewrites; use docs_insert_text / docs_modify_text / docs_apply_* for edits that must keep those.", {
     documentId: z.string(),
     markdown: z.string(),
   }, async ({ documentId, markdown }) => {
-    const doc = await docsApi().documents.get({ documentId });
-    const endIndex = (doc.data.body?.content?.at(-1)?.endIndex || 2) - 1;
-    const requests: docs_v1.Schema$Request[] = [];
-    if (endIndex > 1) {
-      requests.push({ deleteContentRange: { range: { startIndex: 1, endIndex } } });
-    }
-    requests.push({ insertText: { text: markdown, location: { index: 1 } } });
-    await docsApi().documents.batchUpdate({ documentId, requestBody: { requests } });
-    return textResult({ success: true });
+    await driveApi.files.update({
+      fileId: documentId,
+      media: { mimeType: "text/markdown", body: markdown },
+    });
+    return textResult({ success: true, note: "Replaced with native Docs content converted from markdown. Comments/anchors from prior content may not survive." });
   });
 
   server.tool("docs_find_and_replace", "Find and replace text in a document", {
@@ -189,7 +297,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     replace: z.string(),
     matchCase: z.boolean().optional().default(false),
   }, async ({ documentId, find, replace, matchCase }) => {
-    const res = await docsApi().documents.batchUpdate({
+    const res = await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ replaceAllText: { containsText: { text: find, matchCase }, replaceText: replace } }] },
     });
@@ -205,7 +313,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     height: z.number().optional().describe("Height in points"),
   }, async ({ documentId, imageUri, index, width, height }) => {
     const size = width && height ? { width: { magnitude: width, unit: "PT" }, height: { magnitude: height, unit: "PT" } } : undefined;
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertInlineImage: { uri: imageUri, location: { index }, objectSize: size as unknown as undefined } }] },
     });
@@ -216,7 +324,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     index: z.number(),
   }, async ({ documentId, index }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertPageBreak: { location: { index } } }] },
     });
@@ -229,7 +337,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     columns: z.number(),
     index: z.number(),
   }, async ({ documentId, rows, columns, index }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertTable: { rows, columns, location: { index } } }] },
     });
@@ -243,7 +351,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
   }, async ({ documentId, data, index }) => {
     const rows = data.length;
     const columns = data[0]?.length || 1;
-    const docs = docsApi();
+    const docs = docsApi;
 
     await docs.documents.batchUpdate({
       documentId,
@@ -251,9 +359,10 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     });
 
     const doc = await docs.documents.get({ documentId });
-    const tables = doc.data.body?.content?.filter((e) => e.table) || [];
-    const table = tables.at(-1)?.table;
-    if (!table?.tableRows) return textResult({ success: true, note: "Table inserted but could not populate" });
+    const table = findInsertedTable(doc.data.body?.content, index);
+    if (!table?.tableRows) {
+      throw new Error(`Table was inserted at index ${index} but could not be located to populate (expected a table with startIndex ${index + 1}). The table exists but is empty.`);
+    }
 
     const requests: docs_v1.Schema$Request[] = [];
     for (let r = table.tableRows.length - 1; r >= 0; r--) {
@@ -275,9 +384,9 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     rows: z.number(),
     columns: z.number(),
   }, async ({ documentId, rows, columns }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId, fields: "body.content(endIndex)" });
     const endIndex = (doc.data.body?.content?.at(-1)?.endIndex || 2) - 1;
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertTable: { rows, columns, location: { index: endIndex } } }] },
     });
@@ -288,7 +397,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     tableIndex: z.number().describe("0-based table index in the document"),
   }, async ({ documentId, tableIndex }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     if (tableIndex >= tables.length) return textResult({ error: `Table index ${tableIndex} out of range (${tables.length} tables)` });
 
@@ -302,7 +411,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
   server.tool("docs_list_tables", "List all tables in a document", {
     documentId: z.string(),
   }, async ({ documentId }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     return textResult(tables.map((t, i) => ({
       index: i,
@@ -317,12 +426,12 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     tableIndex: z.number(),
   }, async ({ documentId, tableIndex }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     if (tableIndex >= tables.length) return textResult({ error: `Table index ${tableIndex} out of range` });
 
     const el = tables[tableIndex];
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ deleteContentRange: { range: { startIndex: el.startIndex!, endIndex: el.endIndex! } } }] },
     });
@@ -334,19 +443,52 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     tableIndex: z.number(),
     rows: z.array(z.array(z.string())),
   }, async ({ documentId, tableIndex, rows }) => {
-    const docs = docsApi();
+    if (rows.length === 0) return textResult({ success: true, rowsAdded: 0 });
+
+    const docs = docsApi;
     const doc = await docs.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     if (tableIndex >= tables.length) return textResult({ error: "Table not found" });
 
-    const table = tables[tableIndex];
-    const tableEnd = table.endIndex! - 1;
+    const tableElement = tables[tableIndex];
+    const tableStartIndex = tableElement.startIndex!;
+    const existingRowCount = tableElement.table!.rows!;
+    if (existingRowCount < 1) return textResult({ error: "Table has no rows to anchor the insertion to" });
 
-    const requests: docs_v1.Schema$Request[] = [];
-    for (const _row of rows) {
-      requests.push({ insertTableRow: { tableCellLocation: { tableStartLocation: { index: table.startIndex! }, rowIndex: table.table!.rows! }, insertBelow: true } });
+    // Insert `rows.length` empty rows, each anchored below the previous
+    // last row (existingRowCount - 1 + i), so they land in order at the
+    // end of the table.
+    const insertRequests: docs_v1.Schema$Request[] = rows.map((_row, i) => ({
+      insertTableRow: {
+        tableCellLocation: {
+          tableStartLocation: { index: tableStartIndex },
+          rowIndex: existingRowCount - 1 + i,
+        },
+        insertBelow: true,
+      },
+    }));
+    await docs.documents.batchUpdate({ documentId, requestBody: { requests: insertRequests } });
+
+    // Re-fetch to get the real cell start indexes for the newly inserted
+    // (empty) rows, then populate them.
+    const updatedDoc = await docs.documents.get({ documentId });
+    const updatedTables = updatedDoc.data.body?.content?.filter((e) => e.table) || [];
+    const updatedTableRows = updatedTables.find((t) => t.startIndex === tableStartIndex)?.table?.tableRows || [];
+
+    const textRequests: docs_v1.Schema$Request[] = [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const tableRow = updatedTableRows[existingRowCount + i];
+      const cells = tableRow?.tableCells || [];
+      for (let c = cells.length - 1; c >= 0; c--) {
+        const cellText = rows[i][c];
+        const cellStartIndex = cells[c].content?.[0]?.startIndex;
+        if (cellText && cellStartIndex !== undefined) {
+          textRequests.push({ insertText: { text: cellText, location: { index: cellStartIndex } } });
+        }
+      }
     }
-    await docs.documents.batchUpdate({ documentId, requestBody: { requests } });
+    if (textRequests.length) await docs.documents.batchUpdate({ documentId, requestBody: { requests: textRequests } });
+
     return textResult({ success: true, rowsAdded: rows.length });
   });
 
@@ -357,7 +499,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     startCol: z.number(),
     data: z.array(z.array(z.string())),
   }, async ({ documentId, tableIndex, startRow, startCol, data }) => {
-    const docs = docsApi();
+    const docs = docsApi;
     const doc = await docs.documents.get({ documentId });
     const tables = doc.data.body?.content?.filter((e) => e.table) || [];
     if (tableIndex >= tables.length) return textResult({ error: "Table not found" });
@@ -408,7 +550,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     if (foregroundColor) { textStyle.foregroundColor = { color: { rgbColor: foregroundColor } }; fields.push("foregroundColor"); }
     if (link) { textStyle.link = { url: link }; fields.push("link"); }
 
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: {
         requests: [{ updateTextStyle: { textStyle, range: { startIndex, endIndex }, fields: fields.join(",") } }],
@@ -435,7 +577,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     if (spaceAbove !== undefined) { paragraphStyle.spaceAbove = { magnitude: spaceAbove, unit: "PT" }; fields.push("spaceAbove"); }
     if (spaceBelow !== undefined) { paragraphStyle.spaceBelow = { magnitude: spaceBelow, unit: "PT" }; fields.push("spaceBelow"); }
 
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: {
         requests: [{ updateParagraphStyle: { paragraphStyle, range: { startIndex, endIndex }, fields: fields.join(",") } }],
@@ -458,7 +600,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     if (timeFormat) dateElementProperties.timeFormat = timeFormat;
     if (timeZoneId) dateElementProperties.timeZoneId = timeZoneId;
     if (locale) dateElementProperties.locale = locale;
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ insertDate: { location: { index }, dateElementProperties } }] },
     });
@@ -471,7 +613,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     endIndex: z.number(),
     bulletPreset: z.string().optional().default("BULLET_DISC_CIRCLE_SQUARE").describe("Glyph preset, e.g. BULLET_DISC_CIRCLE_SQUARE, BULLET_CHECKBOX, NUMBERED_DECIMAL_ALPHA_ROMAN"),
   }, async ({ documentId, startIndex, endIndex, bulletPreset }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ createParagraphBullets: { range: { startIndex, endIndex }, bulletPreset } }] },
     });
@@ -483,7 +625,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     startIndex: z.number(),
     endIndex: z.number(),
   }, async ({ documentId, startIndex, endIndex }) => {
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: { requests: [{ deleteParagraphBullets: { range: { startIndex, endIndex } } }] },
     });
@@ -497,7 +639,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     targetStartIndex: z.number(),
     targetEndIndex: z.number(),
   }, async ({ documentId, sourceStartIndex, sourceEndIndex, targetStartIndex, targetEndIndex }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     let sourceStyle: docs_v1.Schema$TextStyle | undefined;
     for (const el of doc.data.body?.content || []) {
       for (const pe of el.paragraph?.elements || []) {
@@ -510,7 +652,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     }
     if (!sourceStyle) return textResult({ error: "Could not find source text style" });
 
-    await docsApi().documents.batchUpdate({
+    await docsApi.documents.batchUpdate({
       documentId,
       requestBody: {
         requests: [{ updateTextStyle: { textStyle: sourceStyle, range: { startIndex: targetStartIndex, endIndex: targetEndIndex }, fields: "*" } }],
@@ -519,27 +661,10 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult({ success: true });
   });
 
-  server.tool("docs_add_tab", "Add a new tab to the document", {
-    documentId: z.string(),
-    title: z.string().optional(),
-  }, async ({ documentId, title }) => {
-    // Tabs are managed via the Drive API / Docs API tab support
-    // For now, this creates a section break as a conceptual "tab"
-    return textResult({ note: "Google Docs tab support requires the Docs API v1 tabs feature. Use docs_list_tabs to see existing tabs." });
-  });
-
-  server.tool("docs_rename_tab", "Rename a document tab", {
-    documentId: z.string(),
-    tabId: z.string(),
-    newTitle: z.string(),
-  }, async ({ documentId, tabId, newTitle }) => {
-    return textResult({ note: "Tab renaming requires Docs API v1 tabs support." });
-  });
-
   server.tool("docs_list_tabs", "List all tabs in a document", {
     documentId: z.string(),
   }, async ({ documentId }) => {
-    const doc = await docsApi().documents.get({ documentId });
+    const doc = await docsApi.documents.get({ documentId });
     const tabs = doc.data.tabs || [{ tabProperties: { tabId: "default", title: doc.data.title } }];
     return textResult(tabs.map((t) => ({ tabId: t.tabProperties?.tabId, title: t.tabProperties?.title })));
   });
@@ -549,7 +674,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     content: z.string().describe("Comment text"),
     quotedText: z.string().optional().describe("Text in the document to anchor the comment to"),
   }, async ({ documentId, content, quotedText }) => {
-    const res = await driveApi().comments.create({
+    const res = await driveApi.comments.create({
       fileId: documentId,
       fields: "id,content,author,createdTime",
       requestBody: { content, quotedFileContent: quotedText ? { value: quotedText } : undefined },
@@ -561,7 +686,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     commentId: z.string(),
   }, async ({ documentId, commentId }) => {
-    const res = await driveApi().comments.get({
+    const res = await driveApi.comments.get({
       fileId: documentId, commentId,
       fields: "id,content,author,createdTime,resolved,replies",
     });
@@ -572,12 +697,21 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     includeDeleted: z.boolean().optional().default(false),
   }, async ({ documentId, includeDeleted }) => {
-    const res = await driveApi().comments.list({
-      fileId: documentId,
-      includeDeleted,
-      fields: "comments(id,content,author,createdTime,resolved,quotedFileContent)",
-    });
-    return textResult(res.data.comments || []);
+    const drive = driveApi;
+    const comments: drive_v3.Schema$Comment[] = [];
+    let pageToken: string | undefined;
+    do {
+      const res = await drive.comments.list({
+        fileId: documentId,
+        includeDeleted,
+        pageSize: 100,
+        pageToken,
+        fields: "nextPageToken,comments(id,content,author,createdTime,resolved,quotedFileContent)",
+      });
+      comments.push(...(res.data.comments || []));
+      pageToken = res.data.nextPageToken || undefined;
+    } while (pageToken);
+    return textResult(comments);
   });
 
   server.tool("docs_reply_to_comment", "Reply to a comment", {
@@ -585,7 +719,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     commentId: z.string(),
     content: z.string(),
   }, async ({ documentId, commentId, content }) => {
-    const res = await driveApi().replies.create({
+    const res = await driveApi.replies.create({
       fileId: documentId, commentId,
       fields: "id,content,author,createdTime",
       requestBody: { content },
@@ -597,7 +731,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     commentId: z.string(),
   }, async ({ documentId, commentId }) => {
-    const res = await driveApi().comments.update({
+    const res = await driveApi.comments.update({
       fileId: documentId, commentId,
       fields: "id,resolved",
       requestBody: { resolved: true },
@@ -609,7 +743,7 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     documentId: z.string(),
     commentId: z.string(),
   }, async ({ documentId, commentId }) => {
-    await driveApi().comments.delete({ fileId: documentId, commentId });
+    await driveApi.comments.delete({ fileId: documentId, commentId });
     return textResult({ success: true, commentId });
   });
 }
