@@ -34,6 +34,32 @@ function persistTokens(credPath: string, tokens: Credentials): void {
   }
 }
 
+/**
+ * Hosted / env-token mode: build an auth client from a ready-to-use access
+ * token in the named environment variable. The host owns the token lifecycle
+ * (refresh, persistence), so this client gets the bare token and nothing
+ * else — no client id/secret, no refresh token, no "tokens" listener, and no
+ * filesystem access of any kind. When the token expires mid-process the
+ * Google API's 401 surfaces through the normal error mapping for the host to
+ * classify; this process never attempts a refresh.
+ */
+export function loadEnvTokenAuth(
+  envVarName: string,
+  env: NodeJS.ProcessEnv = process.env
+): OAuth2Client {
+  const token = env[envVarName]?.trim();
+  if (!token) {
+    throw new Error(
+      `Environment variable ${envVarName} is not set or empty. ` +
+        `--access-token-env mode requires a ready-to-use Google access token in it.`
+    );
+  }
+
+  const client = new OAuth2Client();
+  client.setCredentials({ access_token: token });
+  return client;
+}
+
 export function loadAuth(slug: string, tokenDir: string): OAuth2Client {
   const credPath = join(tokenDir, `google-${slug}-credentials.json`);
 

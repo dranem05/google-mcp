@@ -18,6 +18,20 @@ google-mcp --slug jane-acme-com [--token-dir <dir>]
 
 Accounts are provisioned by `bootstrap/lib/add-google-account.sh`, which lives in the **external openbrain repo** (not in this repository). It runs the OAuth consent flow and writes the credentials file for the slug. Re-run it for an existing slug to grant newly required scopes (error messages from this server reference it when a refresh token has expired or been revoked).
 
+### Hosted / env-token mode
+
+For hosts that own token custody themselves (e.g. a hosted runtime that decrypts a per-connection OAuth bundle and refreshes tokens centrally), the server can instead take a ready-to-use access token from an environment variable:
+
+```sh
+GOOGLE_ACCESS_TOKEN=ya29... google-mcp --access-token-env            # reads GOOGLE_ACCESS_TOKEN
+MY_TOKEN_VAR=ya29...       google-mcp --access-token-env MY_TOKEN_VAR
+```
+
+- The token is read once at startup and used for the life of the process. **Refresh is the host's job** — there is no refresh token, no OAuth client id/secret, and on a 401 the readable API error is surfaced for the host to classify; the server never attempts a refresh.
+- **Nothing touches disk**: no credentials file is read and no token writeback of any kind happens.
+- The flag is mutually exclusive with an explicit `--token-dir`. `--slug` becomes optional and, when given, is only used as an account label in error hints.
+- Startup fails fast with a clear error naming the variable if it is unset or empty.
+
 ## Tool families
 
 | Family | Prefix | What it covers |
@@ -29,6 +43,8 @@ Accounts are provisioned by `bootstrap/lib/add-google-account.sh`, which lives i
 | Docs | `docs_*` | Read/write Google Docs (native markdown in/out), text styling, tables, tabs, comments |
 | Sheets | `sheets_*` | Read/write values (single, batch, append), sheet/tab management, formatting, borders/merges, charts, find/replace, named ranges |
 | Slides | `slides_*` | Create/edit presentations, slides, text/shapes/images, styling, PDF export, thumbnails |
+
+By default every family registers. `--families gmail,calendar` restricts the server to just the listed families (valid names: `gmail`, `calendar`, `meet`, `drive`, `docs`, `sheets`, `slides`); an unknown name fails startup with an error listing the valid ones. Works in both auth modes.
 
 ## Operational defaults
 
