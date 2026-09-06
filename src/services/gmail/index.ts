@@ -11,10 +11,10 @@ import {
   decodeBase64UrlToBuffer,
   encodeBase64Url,
   extractAttachments,
+  bestBodyText,
   extractBody,
   formatMessage,
   getHeader,
-  htmlToText,
   type EmailAttachment,
   type OriginalMessageHeaders,
 } from "../../utils/email.js";
@@ -438,7 +438,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
   function pruneThreadMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
     const headers = msg.payload?.headers;
     const body = extractBody(msg.payload);
-    let text = body.text || (body.html ? htmlToText(body.html) : "");
+    let text = bestBodyText(body);
     if (text.length > THREAD_BODY_MAX) text = `${text.slice(0, THREAD_BODY_MAX)}\n\n[truncated]`;
     return {
       id: msg.id,

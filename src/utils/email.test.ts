@@ -255,6 +255,79 @@ describe("formatMessage body capping", () => {
     expect(body).toContain("[truncated: showing 50000 of 60000 characters]");
   });
 
+  it("falls back to HTML when the text/plain part is whitespace only", () => {
+    // An HTML-only sender still emits a text/plain part, typically a bare newline.
+    // It is truthy, so an untrimmed check returns it and drops the whole body.
+    const msg = {
+      id: "m3",
+      payload: {
+        mimeType: "multipart/alternative",
+        headers: [],
+        parts: [
+          { mimeType: "text/plain", body: { data: Buffer.from("\r\n").toString("base64url") } },
+          { mimeType: "text/html", body: { data: Buffer.from("<p>Real body</p>").toString("base64url") } },
+        ],
+      },
+    };
+    expect(formatMessage(msg).body).toBe("Real body");
+  });
+
+  it("still prefers a genuine text/plain part over the HTML alternative", () => {
+    const msg = {
+      id: "m4",
+      payload: {
+        mimeType: "multipart/alternative",
+        headers: [],
+        parts: [
+          { mimeType: "text/plain", body: { data: Buffer.from("Plain wins").toString("base64url") } },
+          { mimeType: "text/html", body: { data: Buffer.from("<p>Nope</p>").toString("base64url") } },
+        ],
+      },
+    };
+    expect(formatMessage(msg).body).toBe("Plain wins");
+  });
+
+  it("falls back to HTML when the text/plain part is only zero-width padding", () => {
+    // String#trim() does not strip U+200C and friends, so a padded stub survives it.
+    const msg = {
+      id: "m5",
+      payload: {
+        mimeType: "multipart/alternative",
+        headers: [],
+        parts: [
+          { mimeType: "text/plain", body: { data: Buffer.from("\u200c \u200c \u200c").toString("base64url") } },
+          { mimeType: "text/html", body: { data: Buffer.from("<p>Real body</p>").toString("base64url") } },
+        ],
+      },
+    };
+    expect(formatMessage(msg).body).toBe("Real body");
+  });
+
+  it("returns an empty body when the text part is blank and there is no HTML", () => {
+    const msg = {
+      id: "m6",
+      payload: {
+        mimeType: "text/plain",
+        headers: [],
+        body: { data: Buffer.from("  \n ").toString("base64url") },
+      },
+    };
+    expect(formatMessage(msg).body).toBe("");
+  });
+
+  it("caps the trimmed text, so leading whitespace cannot push content past the cap", () => {
+    // The emptiness check and the capped value must agree on what the body is.
+    const msg = {
+      id: "m7",
+      payload: {
+        mimeType: "text/plain",
+        headers: [],
+        body: { data: Buffer.from(" ".repeat(49_990) + "CONTENT THAT MUST SURVIVE").toString("base64url") },
+      },
+    };
+    expect(formatMessage(msg).body).toContain("CONTENT THAT MUST SURVIVE");
+  });
+
   it("leaves a normal-sized plain-text body untouched", () => {
     const msg = {
       id: "m2",
