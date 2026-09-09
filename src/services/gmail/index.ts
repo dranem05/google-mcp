@@ -19,7 +19,7 @@ import {
   type OriginalMessageHeaders,
 } from "../../utils/email.js";
 import { withConcurrencyLimit } from "../../utils/concurrency.js";
-import { mapGoogleError } from "../../utils/errors.js";
+import { mapGoogleError, isInsufficientScopeError, describeMissingScopeError } from "../../utils/errors.js";
 import { ensureCacheInitialized, maybePeriodicSweep, cachePath } from "../../utils/download-cache.js";
 
 const FILTER_TEMPLATES: Record<string, { criteria: Record<string, unknown>; action: Record<string, unknown> }> = {
@@ -75,6 +75,23 @@ async function resolveAttachments(attachments: AttachmentInput[] | undefined): P
     })
   );
 }
+
+/**
+ * Picks which sendAs entry gmail_get_signature should return: an exact
+ * sendAsEmail match when one is given, otherwise the account's default
+ * send-as address, falling back to the first entry if none is marked
+ * default (Gmail always has at least the primary address, but defensively
+ * handle an empty/odd list rather than throwing).
+ */
+export function pickSendAs(
+  sendAsList: gmail_v1.Schema$SendAs[],
+  sendAsEmail?: string
+): gmail_v1.Schema$SendAs | undefined {
+  if (sendAsEmail) return sendAsList.find((s) => s.sendAsEmail === sendAsEmail);
+  return sendAsList.find((s) => s.isDefault) ?? sendAsList[0];
+}
+
+const GMAIL_SETTINGS_SCOPE = "https://www.googleapis.com/auth/gmail.settings.basic";
 
 export function registerGmailTools(server: McpServer, ctx: ServiceContext): void {
   const api = google.gmail({ version: "v1", auth: ctx.auth });
@@ -544,5 +561,33 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       },
     });
     return textResult(res.data);
+  });
+
+  server.tool("gmail_get_signature", "Get the real Gmail signature configured in Gmail's UI (Settings > General > Signature), as verbatim HTML — not reconstructed or guessed. Use this before drafting/sending mail that should carry the user's signature, since gmail_draft_email/gmail_send_email do not inject it automatically (the Gmail API only sends the MIME it's given; the signature is normally added client-side by the Gmail web/app UI). Returns the default send-as address's signature unless sendAsEmail is given. REQUIRES the gmail.settings.basic OAuth scope: accounts authorized before this scope was added get a 403 'insufficient authentication scopes' error until add-google-account.sh is re-run for the account; if that happens, tell the user to re-run it (do not retry).", {
+    sendAsEmail: z.string().optional().describe("Specific send-as address to read the signature for, instead of the account's default send-as address"),
+  }, async ({ sendAsEmail }) => {
+    let res;
+    try {
+      res = await api.users.settings.sendAs.list({ userId: "me" });
+    } catch (error) {
+      if (isInsufficientScopeError(error)) {
+        throw new Error(describeMissingScopeError(GMAIL_SETTINGS_SCOPE, { accountSlug: ctx.accountSlug }));
+      }
+      throw error;
+    }
+
+    const target = pickSendAs(res.data.sendAs || [], sendAsEmail);
+    if (!target) {
+      return textResult({
+        error: sendAsEmail ? `No send-as address found matching ${sendAsEmail}.` : "No send-as addresses configured on this account.",
+      });
+    }
+
+    return textResult({
+      sendAsEmail: target.sendAsEmail,
+      displayName: target.displayName,
+      isDefault: target.isDefault ?? false,
+      signature: target.signature ?? "",
+    });
   });
 }
