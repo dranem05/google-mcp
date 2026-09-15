@@ -45,6 +45,12 @@ const EXT_TO_MIME: Record<string, string> = {
   ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 };
 
+// Gmail's "metadata" format returns ONLY the headers named in metadataHeaders, so a header
+// missing from these lists comes back absent rather than erroring — a silent false negative.
+// Both lists are exported so a test can pin the entries that callers depend on.
+export const SEARCH_METADATA_HEADERS = ["From", "To", "Subject", "Date", "Message-ID"];
+export const THREAD_METADATA_HEADERS = ["From", "To", "Cc", "Date", "Subject", "Message-ID"];
+
 const attachmentSchema = z.object({
   path: z.string().optional().describe("Local filesystem path to read the attachment from"),
   content_base64: z.string().optional().describe("Base64 of the file bytes, as an alternative to path"),
@@ -96,7 +102,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     return cachedProfileEmail;
   }
 
-  server.tool("gmail_search_emails", "Search emails using Gmail search syntax", {
+  server.tool("gmail_search_emails", "Search emails using Gmail search syntax. Each hit includes `rfc822MessageId` (the RFC822 Message-ID header, angle brackets included) alongside the Gmail `id`, so a result can be cited or re-found across mailboxes without a second fetch.", {
     query: z.string().describe("Gmail search query (e.g., 'from:example@gmail.com')"),
     maxResults: z.number().optional().describe("Maximum number of results to return"),
     pageToken: z.string().optional().describe("Token from a previous call's nextPageToken to fetch the next page"),
@@ -107,7 +113,8 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
 
     const ids = res.data.messages;
     const settled = await withConcurrencyLimit(ids, 5, async (m) => {
-      const full = await gmail.users.messages.get({ userId: "me", id: m.id!, format: "metadata", metadataHeaders: ["From", "To", "Subject", "Date"] });
+      const full = await gmail.users.messages.get({ userId: "me", id: m.id!, format: "metadata", metadataHeaders: SEARCH_METADATA_HEADERS });
+      const rfc822MessageId = getHeader(full.data.payload?.headers, "message-id");
       return {
         id: full.data.id,
         threadId: full.data.threadId,
@@ -115,10 +122,11 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
         subject: getHeader(full.data.payload?.headers, "subject"),
         from: getHeader(full.data.payload?.headers, "from"),
         date: getHeader(full.data.payload?.headers, "date"),
+        ...(rfc822MessageId ? { rfc822MessageId } : {}),
       };
     });
 
-    const messages: Array<{ id?: string | null; threadId?: string | null; snippet?: string | null; subject?: string; from?: string; date?: string }> = [];
+    const messages: Array<{ id?: string | null; threadId?: string | null; snippet?: string | null; subject?: string; from?: string; date?: string; rfc822MessageId?: string }> = [];
     const failures: Array<{ id?: string | null; error: string }> = [];
     settled.forEach((result, i) => {
       if (result.status === "fulfilled") {
@@ -135,7 +143,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     });
   });
 
-  server.tool("gmail_read_email", "Read the full content of an email", {
+  server.tool("gmail_read_email", "Read the full content of an email. Returns headers, body and attachment metadata, plus `rfc822MessageId` — the RFC822 Message-ID header, returned verbatim with its angle brackets. Unlike the Gmail `id`, it is stable across mailboxes, so it is what `rfc822msgid:` searches and hand-built In-Reply-To threading need.", {
     messageId: z.string().describe("ID of the email message to retrieve"),
   }, async ({ messageId }) => {
     const res = await api.users.messages.get({ userId: "me", id: messageId, format: "full" });
@@ -437,6 +445,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
   const THREAD_BODY_MAX = 2000;
   function pruneThreadMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
     const headers = msg.payload?.headers;
+    const rfc822MessageId = getHeader(headers, "message-id");
     const body = extractBody(msg.payload);
     let text = body.text || (body.html ? htmlToText(body.html) : "");
     if (text.length > THREAD_BODY_MAX) text = `${text.slice(0, THREAD_BODY_MAX)}\n\n[truncated]`;
@@ -447,11 +456,13 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       cc: getHeader(headers, "cc"),
       date: getHeader(headers, "date"),
       subject: getHeader(headers, "subject"),
+      // Present only when Message-ID was requested — see THREAD_METADATA_HEADERS.
+      ...(rfc822MessageId ? { rfc822MessageId } : {}),
       body: text,
     };
   }
 
-  server.tool("gmail_read_thread", "Read an entire email thread (conversation) at once — every message's headers and a trimmed body — given a thread id. Use this instead of gmail_read_email when you need the full back-and-forth context of a conversation.", {
+  server.tool("gmail_read_thread", "Read an entire email thread (conversation) at once — every message's headers and a trimmed body — given a thread id, each with its `rfc822MessageId`. Use this instead of gmail_read_email when you need the full back-and-forth context of a conversation.", {
     threadId: z.string().describe("Gmail thread id (the threadId field on any message in the thread)"),
     format: z.enum(["full", "metadata"]).optional().default("full").describe("full includes trimmed message bodies; metadata returns headers only"),
   }, async ({ threadId, format }) => {
@@ -459,7 +470,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       userId: "me",
       id: threadId,
       format,
-      ...(format === "metadata" ? { metadataHeaders: ["From", "To", "Cc", "Date", "Subject"] } : {}),
+      ...(format === "metadata" ? { metadataHeaders: THREAD_METADATA_HEADERS } : {}),
     });
     return textResult({
       threadId: res.data.id,

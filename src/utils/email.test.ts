@@ -267,3 +267,59 @@ describe("formatMessage body capping", () => {
     expect(formatMessage(msg).body).toBe("short body");
   });
 });
+
+describe("formatMessage rfc822MessageId", () => {
+  const withHeaders = (headers: { name: string; value: string }[]) => ({
+    id: "m1",
+    payload: {
+      mimeType: "text/plain",
+      headers,
+      body: { data: Buffer.from("body").toString("base64url") },
+    },
+  });
+
+  it("returns the RFC822 Message-ID header verbatim, angle brackets included", () => {
+    const msg = withHeaders([
+      { name: "Subject", value: "hi" },
+      { name: "Message-ID", value: "<CAB=abc123@mail.gmail.com>" },
+    ]);
+    expect(formatMessage(msg).rfc822MessageId).toBe("<CAB=abc123@mail.gmail.com>");
+  });
+
+  it("matches the header case-insensitively", () => {
+    const msg = withHeaders([{ name: "message-id", value: "<lower@example.com>" }]);
+    expect(formatMessage(msg).rfc822MessageId).toBe("<lower@example.com>");
+  });
+
+  it("omits the key entirely when the header is absent", () => {
+    const formatted = formatMessage(withHeaders([{ name: "Subject", value: "no msgid" }]));
+    expect("rfc822MessageId" in formatted).toBe(false);
+  });
+
+  it("omits the key when the header is present but empty", () => {
+    const formatted = formatMessage(withHeaders([{ name: "Message-ID", value: "" }]));
+    expect("rfc822MessageId" in formatted).toBe(false);
+  });
+
+  // Relayed and forwarded mail can carry more than one Message-ID. getHeader takes the first,
+  // which is the originating one; pinning it keeps a later refactor from silently flipping to
+  // the last and producing links that resolve to a different message.
+  it("takes the first Message-ID when a relayed message carries several", () => {
+    const msg = withHeaders([
+      { name: "Message-ID", value: "<original@sender.example>" },
+      { name: "Message-ID", value: "<rewritten@relay.example>" },
+    ]);
+    expect(formatMessage(msg).rfc822MessageId).toBe("<original@sender.example>");
+  });
+
+  it("survives a value containing Gmail search and URL metacharacters", () => {
+    const hairy = "<a+b/c=d?e&f#g@mail.example.com>";
+    const formatted = formatMessage(withHeaders([{ name: "Message-ID", value: hairy }]));
+    expect(formatted.rfc822MessageId).toBe(hairy);
+    // The documented consumer recipe: strip brackets, then percent-encode.
+    const encoded = encodeURIComponent((formatted.rfc822MessageId as string).replace(/^<|>$/g, ""));
+    expect(decodeURIComponent(encoded)).toBe("a+b/c=d?e&f#g@mail.example.com");
+    expect(encoded).not.toContain("#");
+    expect(encoded).not.toContain("&");
+  });
+});

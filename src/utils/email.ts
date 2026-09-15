@@ -371,9 +371,15 @@ export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unkn
   const headers = msg.payload?.headers;
   const body = extractBody(msg.payload);
   const attachments = extractAttachments(msg.payload);
+  const rfc822MessageId = getHeader(headers, "message-id");
   return {
     id: msg.id,
     threadId: msg.threadId,
+    // The RFC822 Message-ID header, grouped with the other identifiers. Unlike the Gmail
+    // `id` above it is stable across mailboxes, so callers use it to cite a message
+    // (`rfc822msgid:` searches) and to thread replies by hand. Omitted rather than returned
+    // empty when absent, as some drafts have no Message-ID until they are sent.
+    ...(rfc822MessageId ? { rfc822MessageId } : {}),
     labelIds: msg.labelIds,
     snippet: msg.snippet,
     subject: getHeader(headers, "subject"),
