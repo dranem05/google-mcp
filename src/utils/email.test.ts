@@ -28,6 +28,22 @@ describe("buildRawEmail header hardening", () => {
     expect(subjectLine).toContain("Bcc: attacker@evil.com");
   });
 
+  it("omits the From header when opts.from is not supplied (unchanged default behavior)", () => {
+    const raw = buildRawEmail({ to: ["a@b.com"], subject: "test", body: "hi" });
+    expect(raw.split("\r\n").some((l) => /^From:/i.test(l))).toBe(false);
+  });
+
+  it("sets the From header verbatim when opts.from is supplied", () => {
+    const raw = buildRawEmail({
+      to: ["a@b.com"],
+      subject: "test",
+      body: "hi",
+      from: "Team Alias <alias@example.com>",
+    });
+    const fromLine = raw.split("\r\n").find((l) => l.startsWith("From:"));
+    expect(fromLine).toBe("From: Team Alias <alias@example.com>");
+  });
+
   it("RFC 2047 encodes a non-ASCII subject", () => {
     const raw = buildRawEmail({ to: ["a@b.com"], subject: "Hello 🎉 World", body: "hi" });
     const subjectLine = raw.split("\r\n").find((l) => l.startsWith("Subject:"));

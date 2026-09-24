@@ -11,6 +11,7 @@ import {
   decodeBase64UrlToBuffer,
   encodeBase64Url,
   extractAttachments,
+  extractEmailAddress,
   bestBodyText,
   extractBody,
   formatMessage,
@@ -91,6 +92,28 @@ export function pickSendAs(
   return sendAsList.find((s) => s.isDefault) ?? sendAsList[0];
 }
 
+/**
+ * Resolves a caller-supplied `from` (a bare address or "Name <addr>") against the
+ * account's verified send-as aliases (from users.settings.sendAs.list), returning
+ * the exact From header value to use. The match is by address only — any display
+ * name the caller supplied is ignored in favor of the verified alias's own
+ * displayName (Gmail's source of truth for how that alias should show up), falling
+ * back to the bare address when the alias has no displayName set. Throws a clear
+ * error naming the valid aliases when the address isn't one of them, so a typo or a
+ * stale/unverified address fails loudly instead of silently sending as the default.
+ */
+export function resolveFromAddress(from: string, sendAsList: gmail_v1.Schema$SendAs[]): string {
+  const addr = extractEmailAddress(from).toLowerCase();
+  const match = sendAsList.find((s) => s.sendAsEmail?.toLowerCase() === addr);
+  if (!match) {
+    const valid = sendAsList.map((s) => s.sendAsEmail).filter(Boolean).join(", ");
+    throw new Error(
+      `"${from}" is not a verified send-as address on this account. Valid aliases: ${valid || "(none configured)"}.`
+    );
+  }
+  return match.displayName ? `${match.displayName} <${match.sendAsEmail}>` : match.sendAsEmail!;
+}
+
 const GMAIL_SETTINGS_SCOPE = "https://www.googleapis.com/auth/gmail.settings.basic";
 
 export function registerGmailTools(server: McpServer, ctx: ServiceContext): void {
@@ -111,6 +134,30 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     }
     profileFetched = true;
     return cachedProfileEmail;
+  }
+
+  // Fetches the account's verified send-as aliases, translating the
+  // insufficient-scope case into the same actionable error gmail_get_signature uses.
+  async function listSendAs(): Promise<gmail_v1.Schema$SendAs[]> {
+    try {
+      const res = await api.users.settings.sendAs.list({ userId: "me" });
+      return res.data.sendAs || [];
+    } catch (error) {
+      if (isInsufficientScopeError(error)) {
+        throw new Error(describeMissingScopeError(GMAIL_SETTINGS_SCOPE, { accountSlug: ctx.accountSlug }));
+      }
+      throw error;
+    }
+  }
+
+  // Resolves an optional `from` tool param against the account's verified send-as
+  // aliases into the exact From header value, or undefined when `from` is omitted
+  // (in which case the message sends/drafts as the account's default address,
+  // unchanged from prior behavior).
+  async function resolveFromParam(from: string | undefined): Promise<string | undefined> {
+    if (!from) return undefined;
+    const sendAsList = await listSendAs();
+    return resolveFromAddress(from, sendAsList);
   }
 
   server.tool("gmail_search_emails", "Search emails using Gmail search syntax", {
@@ -166,13 +213,15 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     htmlBody: z.string().optional().describe("HTML version of the email body"),
     cc: z.array(z.string()).optional().describe("CC recipients"),
     bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    from: z.string().optional().describe("Send-as address to send from (bare address or \"Name <addr>\"), instead of the account's default address. Must be one of the account's verified send-as aliases (Gmail Settings > Accounts > Send mail as); an unverified address is rejected with the list of valid aliases."),
     mimeType: z.enum(["text/plain", "text/html", "multipart/alternative"]).optional().default("text/plain"),
     threadId: z.string().optional().describe("Thread ID to reply to"),
     inReplyTo: z.string().optional().describe("RFC822 Message-ID header value to reference (not a Gmail message id). Prefer gmail_reply_to_email, which fills this in for you."),
     attachments: z.array(attachmentSchema).optional().describe("Files to attach, each { path | content_base64, filename?, mime_type? }"),
   }, async (opts) => {
     const attachments = await resolveAttachments(opts.attachments);
-    const raw = encodeBase64Url(buildRawEmail({ ...opts, attachments }));
+    const from = await resolveFromParam(opts.from);
+    const raw = encodeBase64Url(buildRawEmail({ ...opts, from, attachments }));
     const res = await api.users.messages.send({
       userId: "me",
       requestBody: { raw, threadId: opts.threadId },
@@ -187,13 +236,15 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     htmlBody: z.string().optional().describe("HTML version of the email body"),
     cc: z.array(z.string()).optional().describe("CC recipients"),
     bcc: z.array(z.string()).optional().describe("BCC recipients"),
+    from: z.string().optional().describe("Send-as address to draft from (bare address or \"Name <addr>\"), instead of the account's default address. Must be one of the account's verified send-as aliases (Gmail Settings > Accounts > Send mail as); an unverified address is rejected with the list of valid aliases."),
     mimeType: z.enum(["text/plain", "text/html", "multipart/alternative"]).optional().default("text/plain"),
     threadId: z.string().optional().describe("Thread ID to reply to"),
     inReplyTo: z.string().optional().describe("RFC822 Message-ID header value being replied to (not a Gmail message id)"),
     attachments: z.array(attachmentSchema).optional().describe("Files to attach, each { path | content_base64, filename?, mime_type? }"),
   }, async (opts) => {
     const attachments = await resolveAttachments(opts.attachments);
-    const raw = encodeBase64Url(buildRawEmail({ ...opts, attachments }));
+    const from = await resolveFromParam(opts.from);
+    const raw = encodeBase64Url(buildRawEmail({ ...opts, from, attachments }));
     const res = await api.users.drafts.create({
       userId: "me",
       requestBody: { message: { raw, threadId: opts.threadId } },
@@ -205,6 +256,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     messageId: z.string().describe("Gmail API id of the message being replied to (e.g. from gmail_search_emails)"),
     body: z.string().describe("Reply body (plain text)"),
     htmlBody: z.string().optional().describe("HTML version of the reply body"),
+    from: z.string().optional().describe("Send-as address to reply from (bare address or \"Name <addr>\"), instead of the account's default address. Must be one of the account's verified send-as aliases (Gmail Settings > Accounts > Send mail as); an unverified address is rejected with the list of valid aliases."),
     mimeType: z.enum(["text/plain", "text/html", "multipart/alternative"]).optional().default("text/plain"),
     replyAll: z.boolean().optional().default(false).describe("Reply to the sender plus all other recipients (To+Cc), excluding yourself. Default false replies only to the sender."),
     cc: z.array(z.string()).optional().describe("Extra CC recipients to add on top of those computed for the reply"),
@@ -230,6 +282,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     const reply = buildReplyHeaders(originalHeaders, { replyAll: opts.replyAll, selfEmail });
     const cc = [...reply.cc, ...(opts.cc || [])];
     const attachments = await resolveAttachments(opts.attachments);
+    const from = await resolveFromParam(opts.from);
 
     const raw = encodeBase64Url(buildRawEmail({
       to: reply.to,
@@ -238,6 +291,7 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       subject: reply.subject,
       body: opts.body,
       htmlBody: opts.htmlBody,
+      from,
       mimeType: opts.mimeType,
       inReplyTo: reply.inReplyTo || undefined,
       references: reply.references || undefined,
@@ -566,17 +620,8 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
   server.tool("gmail_get_signature", "Get the real Gmail signature configured in Gmail's UI (Settings > General > Signature), as verbatim HTML — not reconstructed or guessed. Use this before drafting/sending mail that should carry the user's signature, since gmail_draft_email/gmail_send_email do not inject it automatically (the Gmail API only sends the MIME it's given; the signature is normally added client-side by the Gmail web/app UI). Returns the default send-as address's signature unless sendAsEmail is given. Works with the existing gmail.modify grant — no additional OAuth scope is required (verified live against a token carrying no gmail.settings.basic). Google's reference docs list gmail.settings.basic for this endpoint and it enforces more loosely than that; if enforcement ever tightens, the tool returns a message naming the missing scope and the re-auth step, and retrying will not help.", {
     sendAsEmail: z.string().optional().describe("Specific send-as address to read the signature for, instead of the account's default send-as address"),
   }, async ({ sendAsEmail }) => {
-    let res;
-    try {
-      res = await api.users.settings.sendAs.list({ userId: "me" });
-    } catch (error) {
-      if (isInsufficientScopeError(error)) {
-        throw new Error(describeMissingScopeError(GMAIL_SETTINGS_SCOPE, { accountSlug: ctx.accountSlug }));
-      }
-      throw error;
-    }
-
-    const target = pickSendAs(res.data.sendAs || [], sendAsEmail);
+    const sendAsList = await listSendAs();
+    const target = pickSendAs(sendAsList, sendAsEmail);
     if (!target) {
       return textResult({
         error: sendAsEmail ? `No send-as address found matching ${sendAsEmail}.` : "No send-as addresses configured on this account.",
