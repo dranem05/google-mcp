@@ -18,8 +18,11 @@ import { z } from "zod";
  *
  * Objects that already declare a catchall (`.passthrough()`, `.strict()`,
  * `.catchall()`) are an explicit choice and are left alone. Node types this
- * walker does not know are left as-is and counted, so coverage is reported
- * rather than assumed.
+ * walker does not know how to traverse (`z.preprocess`/`.transform`/`.pipe`,
+ * `z.lazy`, `z.intersection`, `z.tuple`, and anything else added later) might
+ * hide an object below them, so the walker cannot vouch for strictness past
+ * that point — it throws immediately, naming the tool and the path, rather
+ * than registering a tool whose nested strictness is merely unverified.
  */
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -30,12 +33,10 @@ export interface StrictifyStats {
   objects: number;
   /** Object nodes left alone because they already declared a catchall. */
   explicitCatchall: number;
-  /** Node types not traversed (their children, if any, stay non-strict). */
-  untraversed: Record<string, number>;
 }
 
 export function newStrictifyStats(): StrictifyStats {
-  return { objects: 0, explicitCatchall: 0, untraversed: {} };
+  return { objects: 0, explicitCatchall: 0 };
 }
 
 /** Wrapper types whose single child lives at `def.innerType`. */
@@ -85,7 +86,21 @@ function cloneWith(schema: AnySchema, patch: Record<string, unknown>): AnySchema
   return schema.clone(def, { parent: schema });
 }
 
-export function deepStrict(schema: AnySchema, stats: StrictifyStats): AnySchema {
+function formatPath(path: ReadonlyArray<string | number>): string {
+  return path.length === 0 ? "<root>" : path.join(".");
+}
+
+/**
+ * Walks a schema and rebuilds every reachable object node as strict
+ * (unknown keys rejected). `toolName` and `path` are used only to name the
+ * offending tool/location if the walk hits a node type it cannot traverse.
+ */
+export function deepStrict(
+  schema: AnySchema,
+  stats: StrictifyStats,
+  toolName = "<unknown>",
+  path: ReadonlyArray<string | number> = []
+): AnySchema {
   const def = schema?._zod?.def;
   if (!def) return schema;
   const type: string = def.type;
@@ -97,34 +112,37 @@ export function deepStrict(schema: AnySchema, stats: StrictifyStats): AnySchema 
     }
     const shape: Record<string, AnySchema> = {};
     for (const [key, child] of Object.entries(def.shape as Record<string, AnySchema>)) {
-      shape[key] = deepStrict(child, stats);
+      shape[key] = deepStrict(child, stats, toolName, [...path, key]);
     }
     stats.objects++;
     return cloneWith(schema, { shape, catchall: z.never() });
   }
 
   if (INNER_TYPE_WRAPPERS.has(type)) {
-    const inner = deepStrict(def.innerType, stats);
+    const inner = deepStrict(def.innerType, stats, toolName, path);
     return inner === def.innerType ? schema : cloneWith(schema, { innerType: inner });
   }
 
   if (type === "array") {
-    const element = deepStrict(def.element, stats);
+    const element = deepStrict(def.element, stats, toolName, [...path, "[]"]);
     return element === def.element ? schema : cloneWith(schema, { element });
   }
 
   if (type === "union") {
-    const options = (def.options as AnySchema[]).map((o) => deepStrict(o, stats));
+    const options = (def.options as AnySchema[]).map((o, i) => deepStrict(o, stats, toolName, [...path, `|${i}`]));
     return options.every((o, i) => o === def.options[i]) ? schema : cloneWith(schema, { options });
   }
 
   if (type === "record") {
-    const valueType = deepStrict(def.valueType, stats);
+    const valueType = deepStrict(def.valueType, stats, toolName, [...path, "{}"]);
     return valueType === def.valueType ? schema : cloneWith(schema, { valueType });
   }
 
   if (!LEAF_TYPES.has(type)) {
-    stats.untraversed[type] = (stats.untraversed[type] ?? 0) + 1;
+    throw new Error(
+      `strict-params: tool ${toolName} has a node of type "${type}" at ${formatPath(path)} that this choke ` +
+        `point cannot traverse; it may hide an object that would stay non-strict, so registration is refused`
+    );
   }
   return schema;
 }
@@ -137,7 +155,8 @@ export function deepStrict(schema: AnySchema, stats: StrictifyStats): AnySchema 
  *
  * Throws on a top-level schema that is not an object: that is a registration
  * form this choke point does not understand, and it must fail at startup rather
- * than register a tool with an unknown strictness posture.
+ * than register a tool with an unknown strictness posture. (A non-object node
+ * found deeper in the walk is handled by `deepStrict` itself, the same way.)
  */
 export function strictifyRegisteredSchema(
   toolName: string,
@@ -152,16 +171,5 @@ export function strictifyRegisteredSchema(
         `the registration choke point cannot make it strict`
     );
   }
-  if (def.catchall !== undefined) {
-    stats.explicitCatchall++;
-    return inputSchema;
-  }
-  const shape: Record<string, AnySchema> = {};
-  for (const [key, child] of Object.entries(def.shape as Record<string, AnySchema>)) {
-    shape[key] = deepStrict(child, stats);
-  }
-  stats.objects++;
-  // The SDK builds the top level with zod-mini from a raw shape, so it carries
-  // no checks or metadata of its own; a fresh classic strictObject is exact.
-  return z.strictObject(shape);
+  return deepStrict(inputSchema, stats, toolName);
 }

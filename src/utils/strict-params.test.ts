@@ -55,6 +55,17 @@ describe("strict tool parameters (registration choke point)", () => {
     s.registerTool("bypass", { inputSchema: { a: z.string() } }, async () => ({ content: [] }));
     expect(() => assertToolsStrict(s)).toThrow(/bypass/);
   });
+
+  it("throws at registration when an object is nested under z.preprocess", () => {
+    const s = createServer(makeCtx(), { families: ["meet"] });
+    expect(() =>
+      s.tool(
+        "preprocess-gap",
+        { opts: z.preprocess((v) => v, z.object({ timeZone: z.string().optional() })) },
+        async () => ({ content: [] })
+      )
+    ).toThrow(/preprocess-gap/);
+  });
 });
 
 describe("deepStrict", () => {
