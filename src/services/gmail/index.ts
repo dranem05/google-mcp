@@ -136,30 +136,6 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     return cachedProfileEmail;
   }
 
-  // Fetches the account's verified send-as aliases, translating the
-  // insufficient-scope case into the same actionable error gmail_get_signature uses.
-  async function listSendAs(): Promise<gmail_v1.Schema$SendAs[]> {
-    try {
-      const res = await api.users.settings.sendAs.list({ userId: "me" });
-      return res.data.sendAs || [];
-    } catch (error) {
-      if (isInsufficientScopeError(error)) {
-        throw new Error(describeMissingScopeError(GMAIL_SETTINGS_SCOPE, { accountSlug: ctx.accountSlug }));
-      }
-      throw error;
-    }
-  }
-
-  // Resolves an optional `from` tool param against the account's verified send-as
-  // aliases into the exact From header value, or undefined when `from` is omitted
-  // (in which case the message sends/drafts as the account's default address,
-  // unchanged from prior behavior).
-  async function resolveFromParam(from: string | undefined): Promise<string | undefined> {
-    if (!from) return undefined;
-    const sendAsList = await listSendAs();
-    return resolveFromAddress(from, sendAsList);
-  }
-
   server.tool("gmail_search_emails", "Search emails using Gmail search syntax", {
     query: z.string().describe("Gmail search query (e.g., 'from:example@gmail.com')"),
     maxResults: z.number().optional().describe("Maximum number of results to return"),
@@ -228,6 +204,30 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     });
     return textResult({ id: res.data.id, threadId: res.data.threadId, labelIds: res.data.labelIds });
   });
+
+  // Fetches the account's verified send-as aliases, translating the
+  // insufficient-scope case into the same actionable error gmail_get_signature uses.
+  async function listSendAs(): Promise<gmail_v1.Schema$SendAs[]> {
+    try {
+      const res = await api.users.settings.sendAs.list({ userId: "me" });
+      return res.data.sendAs || [];
+    } catch (error) {
+      if (isInsufficientScopeError(error)) {
+        throw new Error(describeMissingScopeError(GMAIL_SETTINGS_SCOPE, { accountSlug: ctx.accountSlug }));
+      }
+      throw error;
+    }
+  }
+
+  // Resolves an optional `from` tool param against the account's verified send-as
+  // aliases into the exact From header value, or undefined when `from` is omitted
+  // (in which case the message sends/drafts as the account's default address,
+  // unchanged from prior behavior).
+  async function resolveFromParam(from: string | undefined): Promise<string | undefined> {
+    if (!from) return undefined;
+    const sendAsList = await listSendAs();
+    return resolveFromAddress(from, sendAsList);
+  }
 
   server.tool("gmail_draft_email", "Create an email draft", {
     to: z.array(z.string()).describe("Recipient email addresses"),
