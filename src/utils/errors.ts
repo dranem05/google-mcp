@@ -27,6 +27,7 @@ export interface MapGoogleErrorOptions {
 }
 
 const RATE_OR_QUOTA_PATTERN = /rate.?limit|quota/i;
+const INSUFFICIENT_SCOPE_PATTERN = /insufficient authentication scopes/i;
 
 /**
  * Turns a thrown error (typically a GaxiosError from a Google API call) into a
@@ -82,6 +83,36 @@ export function mapGoogleError(error: unknown, opts: MapGoogleErrorOptions = {})
   }
 
   return parts.join(" — ");
+}
+
+/**
+ * True if the given error is a Google API 403 caused specifically by the
+ * OAuth grant lacking a required scope, as opposed to e.g. an ACL/ownership
+ * 403. Google reports this as HTTP 403 with the literal message
+ * "Request had insufficient authentication scopes." — same shape covered by
+ * `meet_create_link`'s documented scope requirement.
+ */
+export function isInsufficientScopeError(error: unknown): boolean {
+  if (!(error instanceof Error) && (typeof error !== "object" || error === null)) return false;
+  const err = error as GaxiosLikeError & Error;
+  if (err.response?.status !== 403) return false;
+  const apiError = err.response?.data?.error;
+  const message = (typeof apiError === "string" ? apiError : apiError?.message) ?? err.message ?? "";
+  return INSUFFICIENT_SCOPE_PATTERN.test(message);
+}
+
+/**
+ * Builds a friendly, actionable message for a scope-insufficient 403: names
+ * the specific missing scope and points at the re-auth fix, instead of the
+ * generic "insufficient authentication scopes" Google returns. Callers should
+ * only use this after confirming `isInsufficientScopeError`.
+ */
+export function describeMissingScopeError(scope: string, opts: MapGoogleErrorOptions = {}): string {
+  const account = opts.accountSlug ?? "<account email>";
+  return (
+    `This requires the "${scope}" OAuth scope, which this account's current grant does not have. ` +
+    `Add it to the scope list and re-run bootstrap/lib/add-google-account.sh ${account} to re-authorize, then restart the MCP server.`
+  );
 }
 
 function errorResult(message: string): CallToolResult {

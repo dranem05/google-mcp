@@ -36,7 +36,7 @@ MY_TOKEN_VAR=ya29...       google-mcp --access-token-env MY_TOKEN_VAR
 
 | Family | Prefix | What it covers |
 |---|---|---|
-| Gmail | `gmail_*` | Search/read/send/reply (threaded, with attachments), threads, drafts, labels, filters, vacation responder, profile |
+| Gmail | `gmail_*` | Search/read/send/reply (threaded, with attachments), threads, drafts, labels, filters, vacation responder, profile, signature |
 | Calendar | `calendar_*` | List/create/update/respond to events, recurring-event instances, free/busy, propose meeting times, Meet links on events, out-of-office/working-location events |
 | Meet | `meet_*` | Create standalone Meet spaces, list conference records, fetch transcripts |
 | Drive | `drive_*` | List/search/move/copy/rename/delete, folder management, download/upload, sharing and permissions |
@@ -55,6 +55,11 @@ By default every family registers. `--families gmail,calendar` restricts the ser
 - **Error mapping** — all tool handlers are wrapped centrally; Google API failures come back as readable errors (HTTP status + API message) with hints for expired auth and quota problems.
 - **Token persistence** — refreshed access tokens are written back to the per-account credentials file automatically.
 - **Downloads** — files fetched to disk land in a shared temp cache (`$TMPDIR/google-mcp`) that is swept of entries older than 24h.
+
+### Gmail notes
+
+- `gmail_get_signature` reads the real signature configured in Gmail's UI (Settings > General > Signature) via `users.settings.sendAs.list`, and returns the HTML **verbatim** — it does not reconstruct or reformat it. `gmail_draft_email`/`gmail_send_email` do not inject the signature automatically (the Gmail API only sends the MIME it's given; the web/app UI normally adds the signature client-side), so fetch it with this tool first for anything that should carry it.
+- **Scope:** `sendAs.list` works with the existing `gmail.modify` grant — **no additional scope is required.** Verified live 2026-09-09 against a token whose recorded scopes contain no `gmail.settings.basic`: the endpoint returned HTTP 200 and the full signature HTML. Google enforces this endpoint more loosely than its reference docs suggest, which document `gmail.settings.basic`. The insufficient-scope handling in this tool is kept as defensive cover in case that enforcement tightens; it is not a condition anyone is expected to hit today.
 
 ### Meet notes
 
