@@ -1,0 +1,167 @@
+import { z } from "zod";
+
+/**
+ * Strict tool parameters, applied at the registration choke point.
+ *
+ * Every tool here is registered with a zod *raw shape*; the MCP SDK turns that
+ * into a plain `z.object(shape)`, whose default is to STRIP unknown keys. A
+ * misspelled parameter (`timezone` for `timeZone`, `bcc_list` for `bcc`) is
+ * therefore discarded silently and the call reports success.
+ *
+ * `strictifyRegisteredSchema` rebuilds a registered input schema so that every
+ * object node — the top level and every nested object reachable through
+ * optional / nullable / default / array / union wrappers — rejects unknown keys.
+ * Leaves are reused by identity, so descriptions, defaults, enums and checks are
+ * untouched; wrappers are cloned with their `def` intact (checks such as
+ * `.min(1)` survive) and parented to the original, so registry metadata
+ * (`.describe()`) is inherited.
+ *
+ * Objects that already declare a catchall (`.passthrough()`, `.strict()`,
+ * `.catchall()`) are an explicit choice and are left alone. Node types this
+ * walker does not know are left as-is and counted, so coverage is reported
+ * rather than assumed.
+ */
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnySchema = any;
+
+export interface StrictifyStats {
+  /** Object nodes made strict (top level included). */
+  objects: number;
+  /** Object nodes left alone because they already declared a catchall. */
+  explicitCatchall: number;
+  /** Node types not traversed (their children, if any, stay non-strict). */
+  untraversed: Record<string, number>;
+}
+
+export function newStrictifyStats(): StrictifyStats {
+  return { objects: 0, explicitCatchall: 0, untraversed: {} };
+}
+
+/** Wrapper types whose single child lives at `def.innerType`. */
+const INNER_TYPE_WRAPPERS = new Set([
+  "optional",
+  "nullable",
+  "default",
+  "prefault",
+  "nonoptional",
+  "readonly",
+  "catch",
+]);
+
+/** Leaf types: nothing below them can carry object keys. */
+const LEAF_TYPES = new Set([
+  "string",
+  "number",
+  "int",
+  "boolean",
+  "bigint",
+  "date",
+  "enum",
+  "literal",
+  "unknown",
+  "any",
+  "null",
+  "undefined",
+  "never",
+  "void",
+  "nan",
+  "symbol",
+  "file",
+  "template_literal",
+  // record keys are open by definition (a map), so nothing to make strict at
+  // this level; its value schema is traversed below via `valueType`.
+]);
+
+function cloneWith(schema: AnySchema, patch: Record<string, unknown>): AnySchema {
+  // Merge by property descriptor, not spread: some defs expose getters (a
+  // `default` def's `defaultValue` re-evaluates function defaults per parse),
+  // and a spread would freeze them into a single value.
+  const def = Object.defineProperties(
+    {},
+    { ...Object.getOwnPropertyDescriptors(schema._zod.def), ...Object.getOwnPropertyDescriptors(patch) }
+  );
+  // `{ parent: schema }` makes the clone inherit registry metadata (.describe()).
+  return schema.clone(def, { parent: schema });
+}
+
+export function deepStrict(schema: AnySchema, stats: StrictifyStats): AnySchema {
+  const def = schema?._zod?.def;
+  if (!def) return schema;
+  const type: string = def.type;
+
+  if (type === "object") {
+    if (def.catchall !== undefined) {
+      stats.explicitCatchall++;
+      return schema;
+    }
+    const shape: Record<string, AnySchema> = {};
+    for (const [key, child] of Object.entries(def.shape as Record<string, AnySchema>)) {
+      shape[key] = deepStrict(child, stats);
+    }
+    stats.objects++;
+    return cloneWith(schema, { shape, catchall: z.never() });
+  }
+
+  if (INNER_TYPE_WRAPPERS.has(type)) {
+    const inner = deepStrict(def.innerType, stats);
+    return inner === def.innerType ? schema : cloneWith(schema, { innerType: inner });
+  }
+
+  if (type === "array") {
+    const element = deepStrict(def.element, stats);
+    return element === def.element ? schema : cloneWith(schema, { element });
+  }
+
+  if (type === "union") {
+    const options = (def.options as AnySchema[]).map((o) => deepStrict(o, stats));
+    return options.every((o, i) => o === def.options[i]) ? schema : cloneWith(schema, { options });
+  }
+
+  if (type === "record") {
+    const valueType = deepStrict(def.valueType, stats);
+    return valueType === def.valueType ? schema : cloneWith(schema, { valueType });
+  }
+
+  if (!LEAF_TYPES.has(type)) {
+    stats.untraversed[type] = (stats.untraversed[type] ?? 0) + 1;
+  }
+  return schema;
+}
+
+/**
+ * Rebuilds a RegisteredTool's `inputSchema` (as produced by the SDK from a raw
+ * shape) as a deep-strict object. Returns `undefined` for tools registered with
+ * no schema at all — those receive `(extra)` instead of `(args, extra)`, so
+ * adding a schema would change the callback's arity.
+ *
+ * Throws on a top-level schema that is not an object: that is a registration
+ * form this choke point does not understand, and it must fail at startup rather
+ * than register a tool with an unknown strictness posture.
+ */
+export function strictifyRegisteredSchema(
+  toolName: string,
+  inputSchema: AnySchema,
+  stats: StrictifyStats
+): AnySchema {
+  if (inputSchema === undefined) return undefined;
+  const def = inputSchema?._zod?.def;
+  if (!def || def.type !== "object") {
+    throw new Error(
+      `strict-params: tool ${toolName} has a non-object input schema (type ${def?.type ?? "unknown"}); ` +
+        `the registration choke point cannot make it strict`
+    );
+  }
+  if (def.catchall !== undefined) {
+    stats.explicitCatchall++;
+    return inputSchema;
+  }
+  const shape: Record<string, AnySchema> = {};
+  for (const [key, child] of Object.entries(def.shape as Record<string, AnySchema>)) {
+    shape[key] = deepStrict(child, stats);
+  }
+  stats.objects++;
+  // The SDK builds the top level with zod-mini from a raw shape, so it carries
+  // no checks or metadata of its own; a fresh classic strictObject is exact.
+  return z.strictObject(shape);
+}

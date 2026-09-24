@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { RegisterTools, ServiceContext } from "./types.js";
-import { installToolErrorHandling } from "./utils/errors.js";
+import { assertToolsStrict, installToolErrorHandling } from "./utils/errors.js";
 import { registerGmailTools } from "./services/gmail/index.js";
 import { registerCalendarTools } from "./services/calendar/index.js";
 import { registerMeetTools } from "./services/meet/index.js";
@@ -71,13 +71,17 @@ export function createServer(ctx: ServiceContext, opts: CreateServerOptions = {}
   });
 
   // Choke point: every server.tool(...) call made by the register*Tools
-  // functions below gets its handler wrapped with Google API error mapping,
-  // without editing each of the ~120 individual tool handlers.
+  // functions below gets its handler wrapped with Google API error mapping
+  // and its input schema made strict (unknown parameters are rejected instead
+  // of silently dropped), without editing each individual tool registration.
   installToolErrorHandling(server, { accountSlug: ctx.accountSlug });
 
   for (const family of opts.families ?? TOOL_FAMILIES) {
     FAMILY_REGISTRARS[family](server, ctx);
   }
+
+  // Fail at startup if any tool escaped the strict-params choke point.
+  assertToolsStrict(server);
 
   return server;
 }

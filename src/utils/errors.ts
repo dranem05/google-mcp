@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
+import { newStrictifyStats, strictifyRegisteredSchema, type StrictifyStats } from "./strict-params.js";
 
 /** Shape of the pieces of a GaxiosError we read. Duck-typed so tests don't need a real GaxiosError. */
 interface GaxiosLikeError {
@@ -115,7 +116,9 @@ export function wrapTool<T extends AnyToolCallback>(handler: T, opts: MapGoogleE
  */
 export function installToolErrorHandling(server: McpServer, opts: MapGoogleErrorOptions = {}): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const original = server.tool.bind(server) as (...args: any[]) => unknown;
+  const original = server.tool.bind(server) as (...args: any[]) => any;
+  const stats = newStrictifyStats();
+  strictifyStats.set(server, stats);
   // `tool` has many overloads but the callback is always the last argument.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (server as any).tool = (...args: any[]) => {
@@ -123,6 +126,39 @@ export function installToolErrorHandling(server: McpServer, opts: MapGoogleError
     if (typeof args[lastIndex] === "function") {
       args[lastIndex] = wrapTool(args[lastIndex], opts);
     }
-    return original(...args);
+    // Let the SDK resolve its own overloads (description / raw shape /
+    // annotations, in any combination), then make the schema it built strict.
+    // Post-processing the RegisteredTool avoids re-implementing the overload
+    // parsing here, which is where a choke point could mis-register silently.
+    const registered = original(...args);
+    registered.inputSchema = strictifyRegisteredSchema(args[0], registered.inputSchema, stats);
+    return registered;
   };
+}
+
+/** Per-server strictify coverage, for startup assertions and tests. */
+export const strictifyStats = new WeakMap<McpServer, StrictifyStats>();
+
+/**
+ * Startup invariant: every registered tool either takes no arguments at all or
+ * has a strict (unknown-keys-rejecting) top-level input schema. Catches any
+ * registration that bypassed the patched `server.tool` (e.g. a future direct
+ * `registerTool` call). Throws, so a violation fails at startup, not per call.
+ */
+export function assertToolsStrict(server: McpServer): { strict: number; noArgs: number } {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const tools = (server as any)._registeredTools as Record<string, { inputSchema?: any }>;
+  let strict = 0;
+  let noArgs = 0;
+  const offenders: string[] = [];
+  for (const [name, tool] of Object.entries(tools)) {
+    const def = tool.inputSchema?._zod?.def;
+    if (tool.inputSchema === undefined) noArgs++;
+    else if (def?.type === "object" && def.catchall?._zod?.def?.type === "never") strict++;
+    else offenders.push(name);
+  }
+  if (offenders.length > 0) {
+    throw new Error(`strict-params: tools registered without strict input schemas: ${offenders.join(", ")}`);
+  }
+  return { strict, noArgs };
 }
