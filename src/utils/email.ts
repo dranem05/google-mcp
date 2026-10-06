@@ -46,6 +46,33 @@ export function getHeader(headers: gmail_v1.Schema$MessagePartHeader[] | undefin
   return headers?.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
 }
 
+/** Extracts the charset parameter from a Content-Type header value (e.g. 'text/plain; charset="iso-8859-1"'), if present. */
+function extractCharset(contentType: string): string | undefined {
+  const m = /charset\s*=\s*"?([^;"]+)"?/i.exec(contentType);
+  return m ? m[1].trim() : undefined;
+}
+
+/**
+ * Decodes a MIME part's base64url body data as text, honoring the part's own
+ * Content-Type charset parameter (e.g. a non-UTF-8 sender like iso-8859-1)
+ * via TextDecoder, then returns a normal JS string (UTF-8 internally, as all
+ * JS strings are). Falls back to plain UTF-8 decoding when the part declares
+ * no charset, declares utf-8, or names a charset TextDecoder doesn't
+ * recognize.
+ */
+export function decodePartText(data: string, headers: gmail_v1.Schema$MessagePartHeader[] | undefined): string {
+  const buf = decodeBase64UrlToBuffer(data);
+  const charset = extractCharset(getHeader(headers, "content-type"));
+  if (charset && !/^utf-?8$/i.test(charset)) {
+    try {
+      return new TextDecoder(charset).decode(buf);
+    } catch {
+      // Unrecognized/unsupported charset label -> fall back to UTF-8 below.
+    }
+  }
+  return buf.toString("utf-8");
+}
+
 /** Strips CR/LF out of a header value so it can't inject additional header lines (or a body separator). */
 function sanitizeHeaderValue(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim();
@@ -158,6 +185,13 @@ function normalizeContentId(id: string): string {
   return trimmed.startsWith("<") ? trimmed : `<${trimmed}>`;
 }
 
+/** The MIME type of the "root" body part that a multipart/related wrapper would contain — text/html or multipart/alternative when there's an HTML body, text/plain otherwise. Used for RFC 2387's required `type` parameter. */
+function rootPartMimeType(opts: { htmlBody?: string; mimeType?: string }): string {
+  if (opts.htmlBody && opts.mimeType === "multipart/alternative") return "multipart/alternative";
+  if (opts.htmlBody || opts.mimeType === "text/html") return "text/html";
+  return "text/plain";
+}
+
 /** Renders one inline image as a base64 MIME part with Content-ID + Content-Disposition: inline, so cid: references in the HTML body resolve. */
 function renderInlineImagePart(img: InlineImagePart): string {
   const filename = sanitizeHeaderValue(img.filename).replace(/"/g, "");
@@ -211,8 +245,11 @@ export function buildRawEmail(opts: {
     ? (() => {
         const boundary = `related_${Date.now()}`;
         const parts = [bodyPart, ...opts.inlineImages!.map(renderInlineImagePart)];
+        // RFC 2387 requires the `type` parameter on multipart/related, naming
+        // the MIME type of the root (first) body part.
+        const rootType = rootPartMimeType(opts);
         return (
-          `Content-Type: multipart/related; boundary="${boundary}"\r\n\r\n` +
+          `Content-Type: multipart/related; boundary="${boundary}"; type="${rootType}"\r\n\r\n` +
           parts.map((p) => `--${boundary}\r\n${p}`).join("\r\n") +
           `\r\n--${boundary}--`
         );

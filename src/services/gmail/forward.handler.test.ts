@@ -72,3 +72,86 @@ describe("gmail_forward_email signature handling", () => {
     expect(out.warning).toBeUndefined();
   });
 });
+
+function decodeRaw(rawB64url: string): string {
+  return Buffer.from(rawB64url, "base64url").toString("utf-8");
+}
+
+describe("gmail_forward_email attachments, threading, and size handling", () => {
+  const pdfBytes = Buffer.from("%PDF-1.4 fake pdf bytes for the handler test");
+  const originalWithAttachment = {
+    id: "m1",
+    threadId: "t1",
+    payload: {
+      mimeType: "multipart/mixed",
+      headers: original.payload.headers,
+      parts: [
+        { mimeType: "text/plain", body: { data: b64url("Original body") } },
+        {
+          mimeType: "application/pdf",
+          filename: "report.pdf",
+          body: { attachmentId: "att1", size: pdfBytes.byteLength },
+        },
+      ],
+    },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    gmailStub.users.drafts.create.mockResolvedValue({ data: { id: "d1", message: { id: "m2", threadId: "t1" } } });
+    gmailStub.users.messages.send.mockResolvedValue({ data: { id: "m3", threadId: "t1" } });
+  });
+
+  it("fetches attachment bytes via attachments.get and includes them in the raw message", async () => {
+    gmailStub.users.messages.get.mockResolvedValue({ data: originalWithAttachment });
+    gmailStub.users.messages.attachments.get.mockResolvedValue({
+      data: { data: pdfBytes.toString("base64url"), size: pdfBytes.byteLength },
+    });
+
+    const out = await forward({});
+    expect(gmailStub.users.messages.attachments.get).toHaveBeenCalledWith({ userId: "me", messageId: "m1", id: "att1" });
+    expect(out.draftId).toBe("d1");
+
+    const raw = decodeRaw(gmailStub.users.drafts.create.mock.calls[0][0].requestBody.message.raw);
+    const pdfBase64 = pdfBytes.toString("base64");
+    expect(raw.replace(/\r\n/g, "")).toContain(pdfBase64);
+  });
+
+  it("refuses a too-large forward before fetching any attachment bytes, and never creates a draft or sends", async () => {
+    const hugeOriginal = {
+      ...originalWithAttachment,
+      payload: {
+        ...originalWithAttachment.payload,
+        parts: [
+          originalWithAttachment.payload.parts[0],
+          { mimeType: "application/pdf", filename: "huge.pdf", body: { attachmentId: "att-huge", size: 20 * 1024 * 1024 } },
+        ],
+      },
+    };
+    gmailStub.users.messages.get.mockResolvedValue({ data: hugeOriginal });
+
+    const out = await forward({});
+    expect(out.error).toMatch(/too large to send/);
+    expect(out.estimatedBytes).toBeGreaterThan(out.limitBytes);
+    expect(gmailStub.users.messages.attachments.get).not.toHaveBeenCalled();
+    expect(gmailStub.users.drafts.create).not.toHaveBeenCalled();
+    expect(gmailStub.users.messages.send).not.toHaveBeenCalled();
+  });
+
+  it("passes the original message's threadId to drafts.create when asDraft is true", async () => {
+    gmailStub.users.messages.get.mockResolvedValue({ data: original });
+    const out = await forward({ asDraft: true });
+    expect(out.threadId).toBe("t1");
+    expect(gmailStub.users.drafts.create.mock.calls[0][0].requestBody.message.threadId).toBe("t1");
+  });
+
+  it("calls messages.send (not drafts.create) and passes threadId when asDraft is false", async () => {
+    gmailStub.users.messages.get.mockResolvedValue({ data: original });
+    const out = await forward({ asDraft: false });
+    expect(gmailStub.users.drafts.create).not.toHaveBeenCalled();
+    expect(gmailStub.users.messages.send).toHaveBeenCalledTimes(1);
+    expect(gmailStub.users.messages.send.mock.calls[0][0].requestBody.threadId).toBe("t1");
+    expect(out.id).toBe("m3");
+    expect(out.threadId).toBe("t1");
+  });
+});

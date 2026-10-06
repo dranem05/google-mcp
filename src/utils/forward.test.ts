@@ -6,12 +6,13 @@ import {
   buildForwardSubject,
   checkForwardRawSize,
   deriveMissingBodyPart,
+  estimateForwardSize,
   largestAttachments,
   parseForwardContent,
   selectForwardAttachments,
   type ForwardHeaderFields,
 } from "./forward.js";
-import { encodeBase64Url, type EmailAttachment, type InlineImagePart } from "./email.js";
+import { type EmailAttachment, type InlineImagePart } from "./email.js";
 
 const b64url = (s: string) => Buffer.from(s, "utf-8").toString("base64url");
 
@@ -85,6 +86,13 @@ describe("deriveMissingBodyPart", () => {
   it("leaves both parts untouched when both are present", () => {
     const original = { text: "plain", html: "<p>rich</p>" };
     expect(deriveMissingBodyPart(original)).toEqual(original);
+  });
+
+  it("derives a >50k-character text/plain alternative from an HTML-only original without truncating it", () => {
+    const big = "<p>" + "x".repeat(60_000) + "</p>";
+    const { text } = deriveMissingBodyPart({ text: "", html: big });
+    expect(text).toHaveLength(60_000);
+    expect(text).not.toContain("[truncated:");
   });
 });
 
@@ -200,9 +208,12 @@ describe("parseForwardContent", () => {
   });
 
   // Shape of a Google Calendar RSVP: the same invite.ics as a text/calendar body
-  // alternative and as an application/ics attachment.
+  // alternative and as an application/ics attachment. Distinct attachmentIds
+  // on the two copies so the dedup assertion below can confirm it's the
+  // *attached* copy that survives, not just any one of two identical parts.
   function calendarPayload(withAttachedCopy: boolean): gmail_v1.Schema$MessagePart {
-    const ics = { attachmentId: "att-ics", size: 1907 };
+    const bodyAltIcs = { attachmentId: "att-ics-body", size: 1907 };
+    const attachedIcs = { attachmentId: "att-ics-attached", size: 1907 };
     return {
       mimeType: "multipart/mixed",
       parts: [
@@ -211,22 +222,203 @@ describe("parseForwardContent", () => {
           parts: [
             { mimeType: "text/plain", body: { data: b64url("Jane accepted") } },
             { mimeType: "text/html", body: { data: b64url("<p>Jane accepted</p>") } },
-            { mimeType: "text/calendar", filename: "invite.ics", body: ics },
+            { mimeType: "text/calendar", filename: "invite.ics", body: bodyAltIcs },
           ],
         },
-        ...(withAttachedCopy ? [{ mimeType: "application/ics", filename: "invite.ics", body: ics }] : []),
+        ...(withAttachedCopy ? [{ mimeType: "application/ics", filename: "invite.ics", body: attachedIcs }] : []),
       ],
     };
   }
 
-  it("forwards a calendar invite's .ics once when it is both a body alternative and an attachment", () => {
+  it("forwards a calendar invite's .ics once when it is both a body alternative and an attachment, keeping the attached copy", () => {
     const parsed = parseForwardContent(calendarPayload(true));
     expect(parsed.attachments.map((a) => a.mimeType)).toEqual(["application/ics"]);
+    expect(parsed.attachments[0].attachmentId).toBe("att-ics-attached");
   });
 
   it("keeps a calendar body alternative as the attachment when there is no attached copy", () => {
     const parsed = parseForwardContent(calendarPayload(false));
     expect(parsed.attachments.map((a) => `${a.mimeType} ${a.filename}`)).toEqual(["text/calendar invite.ics"]);
+  });
+
+  it("decodes a text/plain part using its declared charset rather than assuming UTF-8", () => {
+    const latin1Bytes = Buffer.from("Caf\xe9 cr\xe8me", "latin1");
+    const payload: gmail_v1.Schema$MessagePart = {
+      mimeType: "text/plain",
+      headers: [{ name: "Content-Type", value: 'text/plain; charset="iso-8859-1"' }],
+      body: { data: latin1Bytes.toString("base64url") },
+    };
+    const parsed = parseForwardContent(payload);
+    expect(parsed.text).toBe("Café crème");
+  });
+
+  it("decodes a text/html part using its declared charset rather than assuming UTF-8", () => {
+    const latin1Bytes = Buffer.from("<p>Caf\xe9</p>", "latin1");
+    const payload: gmail_v1.Schema$MessagePart = {
+      mimeType: "text/html",
+      headers: [{ name: "Content-Type", value: "text/html; charset=ISO-8859-1" }],
+      body: { data: latin1Bytes.toString("base64url") },
+    };
+    const parsed = parseForwardContent(payload);
+    expect(parsed.html).toBe("<p>Café</p>");
+  });
+
+  it("classifies an inline image only when the HTML actually references its Content-ID via cid:, keeping an unreferenced Content-ID part as a regular attachment", () => {
+    const payload: gmail_v1.Schema$MessagePart = {
+      mimeType: "multipart/related",
+      parts: [
+        { mimeType: "text/html", body: { data: b64url("<p>no image here</p>") } },
+        {
+          mimeType: "image/png",
+          filename: "unused.png",
+          headers: [{ name: "Content-ID", value: "<unused@example.com>" }],
+          body: { attachmentId: "att-unused", size: 10 },
+        },
+      ],
+    };
+    const parsed = parseForwardContent(payload);
+    expect(parsed.inlineImages).toEqual([]);
+    expect(parsed.attachments.map((a) => a.filename)).toEqual(["unused.png"]);
+  });
+
+  it("classifies a part with Content-Disposition: attachment as a regular attachment even when it also carries a Content-ID", () => {
+    const payload: gmail_v1.Schema$MessagePart = {
+      mimeType: "multipart/mixed",
+      parts: [
+        { mimeType: "text/html", body: { data: b64url('<p><img src="cid:part1.123@x"></p>') } },
+        {
+          mimeType: "application/pdf",
+          filename: "contract.pdf",
+          headers: [
+            { name: "Content-Disposition", value: 'attachment; filename="contract.pdf"' },
+            { name: "Content-ID", value: "<part1.123@x>" },
+          ],
+          body: { attachmentId: "att-pdf", size: 5_000_000 },
+        },
+      ],
+    };
+    const parsed = parseForwardContent(payload);
+    expect(parsed.inlineImages).toEqual([]);
+    expect(parsed.attachments).toHaveLength(1);
+    expect(parsed.attachments[0].filename).toBe("contract.pdf");
+    // And it's dropped entirely (not kept as an inline fallback) when
+    // regular attachments are excluded.
+    const selected = selectForwardAttachments(parsed, false);
+    expect(selected.attachments).toEqual([]);
+    expect(selected.inlineImages).toEqual([]);
+  });
+
+  it("keeps a nameless inline image (Content-ID only, no filename) under a generated filename, still matched to its cid: reference", () => {
+    const payload: gmail_v1.Schema$MessagePart = {
+      mimeType: "multipart/related",
+      parts: [
+        { mimeType: "text/html", body: { data: b64url('<img src="cid:img1">') } },
+        {
+          mimeType: "image/png",
+          filename: "",
+          headers: [{ name: "Content-ID", value: "<img1>" }],
+          body: { attachmentId: "att-img1", size: 100 },
+        },
+      ],
+    };
+    const parsed = parseForwardContent(payload);
+    expect(parsed.attachments).toEqual([]);
+    expect(parsed.inlineImages).toHaveLength(1);
+    expect(parsed.inlineImages[0].filename).toBe("img1.png");
+    expect(parsed.inlineImages[0].contentId).toBe("<img1>");
+  });
+
+  it("keeps a nameless non-text leaf (no Content-ID) under a generated attachment-N filename instead of dropping it", () => {
+    const payload: gmail_v1.Schema$MessagePart = {
+      mimeType: "multipart/mixed",
+      parts: [
+        { mimeType: "text/plain", body: { data: b64url("see attached") } },
+        { mimeType: "application/pdf", filename: "", body: { attachmentId: "att-nameless", size: 42 } },
+      ],
+    };
+    const parsed = parseForwardContent(payload);
+    expect(parsed.attachments).toHaveLength(1);
+    expect(parsed.attachments[0].filename).toBe("attachment-1.pdf");
+    expect(parsed.attachments[0].attachmentId).toBe("att-nameless");
+  });
+
+  it("keeps a nameless text/calendar alternative with no attached copy as invite.ics", () => {
+    const payload: gmail_v1.Schema$MessagePart = {
+      mimeType: "multipart/alternative",
+      parts: [
+        { mimeType: "text/plain", body: { data: b64url("t") } },
+        { mimeType: "text/calendar", filename: "", body: { data: b64url("BEGIN:VCALENDAR"), size: 15 } },
+      ],
+    };
+    const parsed = parseForwardContent(payload);
+    expect(parsed.attachments).toHaveLength(1);
+    expect(parsed.attachments[0].filename).toBe("invite.ics");
+  });
+
+  it("keeps a message/rfc822 part as an attachment leaf (named .eml), without merging its inner body into the outer text/html", () => {
+    const payload: gmail_v1.Schema$MessagePart = {
+      mimeType: "multipart/mixed",
+      parts: [
+        { mimeType: "text/plain", body: { data: b64url("Please see the forwarded message below.") } },
+        { mimeType: "text/html", body: { data: b64url("<p>Please see the forwarded message below.</p>") } },
+        {
+          mimeType: "message/rfc822",
+          filename: "",
+          body: { attachmentId: "att-eml", size: 2048 },
+          parts: [
+            {
+              mimeType: "multipart/alternative",
+              parts: [
+                { mimeType: "text/plain", body: { data: b64url("INNER ORIGINAL TEXT") } },
+                { mimeType: "text/html", body: { data: b64url("<p>INNER ORIGINAL HTML</p>") } },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseForwardContent(payload);
+    expect(parsed.text).toBe("Please see the forwarded message below.");
+    expect(parsed.html).toBe("<p>Please see the forwarded message below.</p>");
+    expect(parsed.text).not.toContain("INNER ORIGINAL TEXT");
+    expect(parsed.html).not.toContain("INNER ORIGINAL HTML");
+    expect(parsed.attachments).toHaveLength(1);
+    expect(parsed.attachments[0]).toMatchObject({ filename: "forwarded-message.eml", mimeType: "message/rfc822", attachmentId: "att-eml" });
+    expect(parsed.warnings).toEqual([]);
+  });
+
+  it("treats message/delivery-status as an attachment, not body text", () => {
+    const payload: gmail_v1.Schema$MessagePart = {
+      mimeType: "multipart/report",
+      parts: [
+        { mimeType: "text/plain", body: { data: b64url("Delivery failed.") } },
+        { mimeType: "message/delivery-status", body: { data: b64url("Status: 5.1.1") } },
+      ],
+    };
+    const parsed = parseForwardContent(payload);
+    expect(parsed.text).toBe("Delivery failed.");
+    expect(parsed.attachments).toHaveLength(1);
+    expect(parsed.attachments[0].filename).toBe("delivery-status.txt");
+  });
+
+  it("warns rather than silently dropping an rfc822 part with no attachmentId and no inline data", () => {
+    const payload: gmail_v1.Schema$MessagePart = {
+      mimeType: "multipart/mixed",
+      parts: [
+        { mimeType: "text/plain", body: { data: b64url("hi") } },
+        {
+          mimeType: "message/rfc822",
+          filename: "",
+          body: { size: 0 },
+          parts: [{ mimeType: "text/plain", body: { data: b64url("inner, unreachable") } }],
+        },
+      ],
+    };
+    const parsed = parseForwardContent(payload);
+    expect(parsed.attachments).toEqual([]);
+    expect(parsed.text).not.toContain("inner, unreachable");
+    expect(parsed.warnings).toHaveLength(1);
+    expect(parsed.warnings[0]).toMatch(/message\/rfc822.*no attachment data/);
   });
 });
 
@@ -347,12 +539,12 @@ describe("buildForwardRawEmail", () => {
 });
 
 describe("checkForwardRawSize", () => {
-  it("passes for a small encoded message", () => {
-    const check = checkForwardRawSize(encodeBase64Url("small message"));
+  it("passes for a small raw MIME message", () => {
+    const check = checkForwardRawSize("small message");
     expect(check.ok).toBe(true);
   });
 
-  it("refuses an encoded message over the 25MB limit", () => {
+  it("refuses a raw MIME message over the 25MB limit", () => {
     const big = "a".repeat(26 * 1024 * 1024);
     const check = checkForwardRawSize(big);
     expect(check.ok).toBe(false);
@@ -364,6 +556,34 @@ describe("checkForwardRawSize", () => {
     expect(check.ok).toBe(false);
     expect(check.totalBytes).toBe(10);
     expect(check.limitBytes).toBe(5);
+  });
+
+  it("checks the MIME size, not the larger base64url-encoded transport size — a message between the two thresholds is not refused", () => {
+    // 19 MiB of raw MIME text encodes to ~25.3 MiB in base64url, which the
+    // old (wrong) encoded-size check would have refused.
+    const raw = "a".repeat(19 * 1024 * 1024);
+    const check = checkForwardRawSize(raw);
+    expect(check.ok).toBe(true);
+  });
+});
+
+describe("estimateForwardSize", () => {
+  it("passes when the estimated size (parts scaled 4/3 for base64, plus body bytes) is under the limit", () => {
+    const est = estimateForwardSize([{ size: 1000 }, { size: 2000 }], 500);
+    expect(est.ok).toBe(true);
+    expect(est.estimatedBytes).toBe(Math.ceil(1000 * (4 / 3)) + Math.ceil(2000 * (4 / 3)) + 500);
+  });
+
+  it("refuses before any bytes are fetched when selected parts' declared sizes alone already exceed the limit", () => {
+    const est = estimateForwardSize([{ size: 20 * 1024 * 1024 }], 0, 25 * 1024 * 1024);
+    expect(est.ok).toBe(false);
+    expect(est.estimatedBytes).toBeGreaterThan(est.limitBytes);
+  });
+
+  it("respects a custom limit", () => {
+    const est = estimateForwardSize([{ size: 10 }], 0, 5);
+    expect(est.ok).toBe(false);
+    expect(est.limitBytes).toBe(5);
   });
 });
 

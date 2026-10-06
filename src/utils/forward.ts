@@ -1,15 +1,19 @@
 import { gmail_v1 } from "googleapis";
 import {
   buildRawEmail,
-  decodeBase64Url,
   decodeBase64UrlToBuffer,
+  decodePartText,
   getHeader,
   htmlToText,
   type EmailAttachment,
   type InlineImagePart,
 } from "./email.js";
 
-/** Gmail's own send-size ceiling (RFC822 bytes of the base64url-encoded raw message). */
+// Gmail's documented send limit is 25 MB, measured against the RFC822 MIME
+// message (headers + body, before any transport-level encoding the API does
+// on top). The API's actual JSON-request-body ceiling for the base64url
+// `raw` field is unverified/undocumented, so rather than guess at that we
+// gate on the 25 MB MIME-message threshold Gmail itself publishes.
 export const GMAIL_MAX_SEND_BYTES = 25 * 1024 * 1024;
 
 function escapeHtml(value: string): string {
@@ -62,11 +66,21 @@ export function buildForwardHeaderBlock(fields: ForwardHeaderFields): { text: st
   return { text, html };
 }
 
-/** Fills in whichever of text/html the original lacked, deriving it minimally from the other. Leaves both alone when both (or neither) are present. */
+/**
+ * Fills in whichever of text/html the original lacked, deriving it minimally
+ * from the other. Leaves both alone when both (or neither) are present.
+ *
+ * The derived text/plain alternative goes through htmlToText's *uncapped*
+ * form (maxLength: Infinity) — htmlToText's default 50k display cap exists
+ * for a body shown to an LLM caller, not for a MIME part that's about to be
+ * attached to an outgoing message; capping it here would silently truncate
+ * the forwarded email's plain-text alternative and append a "[truncated: …]"
+ * note into the message itself.
+ */
 export function deriveMissingBodyPart(original: { text: string; html: string }): { text: string; html: string } {
   let { text, html } = original;
   if (!html && text) html = minimalTextToHtml(text);
-  else if (!text && html) text = htmlToText(html);
+  else if (!text && html) text = htmlToText(html, Infinity);
   return { text, html };
 }
 
@@ -106,62 +120,167 @@ export interface ParsedForwardContent {
   html: string;
   inlineImages: ForwardAttachment[];
   attachments: ForwardAttachment[];
+  /** Non-fatal issues found while walking the MIME tree (e.g. a part that couldn't be kept at all). Surfaced to the caller as a warning, never thrown. */
+  warnings: string[];
+}
+
+/** Strips angle brackets (and surrounding whitespace) off a Content-ID header value, for comparing it against a bare `cid:...` reference in HTML. */
+function bareContentId(id: string): string {
+  return id.trim().replace(/^</, "").replace(/>$/, "").trim();
+}
+
+/** True when `html` contains a `cid:` reference to `contentId`, case-insensitively and regardless of the header's own angle-bracket formatting. */
+function htmlReferencesCid(html: string, contentId: string): boolean {
+  const bare = bareContentId(contentId).toLowerCase();
+  return bare.length > 0 && html.toLowerCase().includes(`cid:${bare}`);
+}
+
+/** True when a Content-Disposition header value explicitly says "attachment" (as opposed to "inline" or being absent). */
+function isExplicitAttachmentDisposition(value: string): boolean {
+  return /^\s*attachment/i.test(value);
+}
+
+/** Minimal filename-extension guess from a MIME type's subtype (e.g. "image/png" -> "png"), used only to name a leaf part that arrived with no filename at all. */
+function extFromMimeType(mimeType: string): string {
+  const subtype = (mimeType.split("/")[1] || "bin").split("+")[0].replace(/^x-/, "");
+  return subtype || "bin";
+}
+
+/** One leaf part found while walking the MIME tree, before classification (inline vs. attachment) and filename resolution — both of which depend on having walked the *entire* tree first (classification needs the fully-collected HTML; a calendar alternative needs to know whether an attached duplicate exists elsewhere). */
+interface RawLeaf {
+  filename: string;
+  mimeType: string;
+  size: number;
+  attachmentId?: string;
+  /** Raw base64url bytes, undecoded, when Gmail returned them inline on the part itself. */
+  data?: string;
+  contentId?: string;
+  isAttachmentDisposition: boolean;
+  /** A text/calendar part that is itself a body alternative (directly under multipart/alternative), not a standalone attachment part. */
+  isCalendarAlternative: boolean;
+  /** message/rfc822 or message/delivery-status — always an attachment leaf, never walked into for body text. */
+  isMessageContainer: boolean;
 }
 
 /**
  * Walks a message's MIME part tree collecting its text/plain and text/html
- * bodies plus every leaf attachment, classifying each leaf as an inline (cid:)
- * image or a regular attachment by the presence of a Content-ID header.
- * Recurses through arbitrary multipart nesting (mixed > alternative, mixed >
- * related > alternative + inline images, etc.) rather than assuming one shape.
+ * bodies (decoded per each part's own Content-Type charset) plus every leaf
+ * attachment. Recurses through arbitrary multipart nesting (mixed >
+ * alternative, mixed > related > alternative + inline images, etc.) rather
+ * than assuming one shape.
+ *
+ * Classification (inline image vs. regular attachment) happens only after
+ * the whole tree — and so the full HTML body — has been collected: a part is
+ * an inline image only if it carries a Content-ID that the collected HTML
+ * actually references via `cid:`, and only if it isn't marked
+ * Content-Disposition: attachment. Everything else with a Content-ID (e.g. a
+ * PDF some mail clients tag with one) is a regular attachment.
+ *
+ * message/rfc822 and message/delivery-status parts are always kept as
+ * attachment leaves (never walked into for body text, to avoid merging an
+ * inner forwarded/bounced message's text into the outer body); an rfc822
+ * part with no attachmentId and no inline data is reported via `warnings`
+ * rather than silently dropped.
+ *
+ * A non-text leaf with fetchable bytes but an empty filename (a bare inline
+ * image, a nameless calendar alternative, a nameless forwarded message) is
+ * kept rather than dropped, under a generated filename.
  */
 export function parseForwardContent(payload: gmail_v1.Schema$MessagePart | undefined): ParsedForwardContent {
-  const result: ParsedForwardContent = { text: "", html: "", inlineImages: [], attachments: [] };
+  const result: ParsedForwardContent = { text: "", html: "", inlineImages: [], attachments: [], warnings: [] };
   if (!payload) return result;
 
-  // text/calendar parts that are a body alternative of an invite/RSVP, kept
-  // aside so they can be dropped when the same .ics is also attached.
-  const calendarAlternatives: ForwardAttachment[] = [];
+  const rawLeaves: RawLeaf[] = [];
 
   function walk(part: gmail_v1.Schema$MessagePart, parentMimeType?: string): void {
-    const isLeafFile = !!part.filename && part.filename.length > 0 && (!!part.body?.attachmentId || !!part.body?.data);
-    if (isLeafFile) {
-      const contentId = getHeader(part.headers, "content-id") || undefined;
-      const entry: ForwardAttachment = {
-        filename: part.filename!,
-        mimeType: part.mimeType || "application/octet-stream",
-        size: part.body?.size || 0,
-        attachmentId: part.body?.attachmentId || undefined,
-        // Decode as raw bytes (base64url -> buffer), not as UTF-8 text —
-        // these may be binary attachment bytes, and decodeBase64Url's UTF-8
-        // round-trip would corrupt anything that isn't valid UTF-8.
-        contentBase64: part.body?.data ? decodeBase64UrlToBuffer(part.body.data).toString("base64") : undefined,
-        contentId,
-      };
-      if (contentId) result.inlineImages.push(entry);
-      else if (entry.mimeType === "text/calendar" && parentMimeType === "multipart/alternative") calendarAlternatives.push(entry);
-      else result.attachments.push(entry);
+    const mimeType = part.mimeType || "application/octet-stream";
+    const isMessageContainer = mimeType === "message/rfc822" || mimeType === "message/delivery-status";
+    const isBodyAlternative = (mimeType === "text/plain" || mimeType === "text/html") && !part.filename && !!part.body?.data;
+
+    // Container: recurse into children. message/rfc822 (and delivery-status)
+    // are excluded even though they may carry `.parts` of their own — those
+    // are the *inner* message's MIME tree, which must stay un-walked.
+    if (!isMessageContainer && !isBodyAlternative && mimeType !== "text/calendar" && part.parts) {
+      for (const child of part.parts) walk(child, mimeType);
       return;
     }
 
-    if (part.mimeType === "text/plain" && part.body?.data) {
-      result.text += decodeBase64Url(part.body.data);
-      return;
-    }
-    if (part.mimeType === "text/html" && part.body?.data) {
-      result.html += decodeBase64Url(part.body.data);
+    if (isBodyAlternative) {
+      const decoded = decodePartText(part.body!.data!, part.headers);
+      if (mimeType === "text/plain") result.text += decoded;
+      else result.html += decoded;
       return;
     }
 
-    if (part.parts) {
-      for (const child of part.parts) walk(child, part.mimeType || undefined);
+    // Leaf. Keep it only if there are bytes to fetch or already inline;
+    // otherwise there's nothing to attach. A message container with no
+    // bytes at all is still worth flagging, since silently dropping a
+    // forwarded/bounced message is easy to miss.
+    const hasBytes = !!part.body?.attachmentId || !!part.body?.data;
+    if (!hasBytes) {
+      if (isMessageContainer) {
+        result.warnings.push(`Dropped a ${mimeType} part with no attachment data (no attachmentId and no inline body data).`);
+      }
+      return;
     }
+
+    rawLeaves.push({
+      filename: part.filename || "",
+      mimeType,
+      size: part.body?.size || 0,
+      attachmentId: part.body?.attachmentId || undefined,
+      data: part.body?.data || undefined,
+      contentId: getHeader(part.headers, "content-id") || undefined,
+      isAttachmentDisposition: isExplicitAttachmentDisposition(getHeader(part.headers, "content-disposition")),
+      isCalendarAlternative: mimeType === "text/calendar" && parentMimeType === "multipart/alternative",
+      isMessageContainer,
+    });
   }
 
   walk(payload);
+
+  let namelessCounter = 0;
+  function resolvedFilename(leaf: RawLeaf): string {
+    if (leaf.filename) return leaf.filename;
+    if (leaf.isCalendarAlternative) return "invite.ics";
+    if (leaf.mimeType === "message/rfc822") return "forwarded-message.eml";
+    if (leaf.mimeType === "message/delivery-status") return "delivery-status.txt";
+    if (leaf.contentId) return `${bareContentId(leaf.contentId)}.${extFromMimeType(leaf.mimeType)}`;
+    namelessCounter += 1;
+    return `attachment-${namelessCounter}.${extFromMimeType(leaf.mimeType)}`;
+  }
+
+  // text/calendar body alternatives are classified last, since whether they
+  // survive depends on whether an attached duplicate of the same invite
+  // already made it into `attachments` from a sibling leaf.
+  const calendarEntries: ForwardAttachment[] = [];
+
+  for (const leaf of rawLeaves) {
+    const entry: ForwardAttachment = {
+      filename: resolvedFilename(leaf),
+      mimeType: leaf.mimeType,
+      size: leaf.size,
+      attachmentId: leaf.attachmentId,
+      // Decode as raw bytes (base64url -> buffer), not as UTF-8 text — these
+      // may be binary attachment bytes, and a UTF-8 round-trip would corrupt
+      // anything that isn't valid UTF-8.
+      contentBase64: leaf.data ? decodeBase64UrlToBuffer(leaf.data).toString("base64") : undefined,
+      contentId: leaf.contentId,
+    };
+
+    if (leaf.isCalendarAlternative) {
+      calendarEntries.push(entry);
+      continue;
+    }
+
+    const isInline = !!leaf.contentId && !leaf.isAttachmentDisposition && htmlReferencesCid(result.html, leaf.contentId);
+    if (isInline) result.inlineImages.push(entry);
+    else result.attachments.push(entry);
+  }
+
   // Calendar mail (e.g. Google Calendar) carries the same invite.ics twice: as a
   // text/calendar body alternative and as an attachment. Forward it once.
-  for (const cal of calendarAlternatives) {
+  for (const cal of calendarEntries) {
     const attachedToo = result.attachments.some((a) => a.filename === cal.filename && a.size === cal.size);
     if (!attachedToo) result.attachments.push(cal);
   }
@@ -219,10 +338,42 @@ export interface ForwardSizeCheck {
   limitBytes: number;
 }
 
-/** Checks the final base64url-encoded raw message against Gmail's send-size ceiling. Must be run on the actual encoded string that would be POSTed, since that (not the pre-encoding MIME text) is what the limit applies to. */
-export function checkForwardRawSize(encodedRaw: string, limitBytes = GMAIL_MAX_SEND_BYTES): ForwardSizeCheck {
-  const totalBytes = Buffer.byteLength(encodedRaw, "utf-8");
+/**
+ * Checks the raw RFC822 MIME message (the string buildForwardRawEmail
+ * returns, *before* it's base64url-encoded for the API's `raw` field)
+ * against Gmail's documented 25 MB send limit. That limit is published
+ * against the MIME message itself, not the subsequent base64url transport
+ * encoding (which runs ~33% larger) — checking the encoded string instead
+ * would refuse forwards Gmail's own web UI happily sends.
+ */
+export function checkForwardRawSize(raw: string, limitBytes = GMAIL_MAX_SEND_BYTES): ForwardSizeCheck {
+  const totalBytes = Buffer.byteLength(raw, "utf-8");
   return { ok: totalBytes <= limitBytes, totalBytes, limitBytes };
+}
+
+export interface ForwardSizeEstimate {
+  ok: boolean;
+  estimatedBytes: number;
+  limitBytes: number;
+}
+
+/**
+ * Cheap pre-download estimate of the final MIME message size, computed from
+ * Gmail's already-known `body.size` for each selected inline-image/attachment
+ * part (pre-base64, so scaled by the ~4/3 base64 expansion it'll undergo)
+ * plus the already-known text/html body byte lengths — all available before
+ * fetching a single attachment byte. Lets a forward that's already too big
+ * be refused without downloading megabytes of attachment data first just to
+ * throw it away.
+ */
+export function estimateForwardSize(
+  parts: Array<{ size: number }>,
+  bodyBytes: number,
+  limitBytes = GMAIL_MAX_SEND_BYTES
+): ForwardSizeEstimate {
+  const attachmentBytes = parts.reduce((sum, p) => sum + Math.ceil((p.size || 0) * (4 / 3)), 0);
+  const estimatedBytes = attachmentBytes + bodyBytes;
+  return { ok: estimatedBytes <= limitBytes, estimatedBytes, limitBytes };
 }
 
 /** The N largest items by size, for naming in a too-large-to-send error. */

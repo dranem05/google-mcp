@@ -24,6 +24,7 @@ import {
 import {
   buildForwardRawEmail,
   checkForwardRawSize,
+  estimateForwardSize,
   largestAttachments,
   parseForwardContent,
   selectForwardAttachments,
@@ -100,25 +101,39 @@ async function resolveForwardBytes(api: gmail_v1.Gmail, messageId: string, item:
   return decodeBase64UrlToBuffer(res.data.data || "").toString("base64");
 }
 
-async function resolveForwardAttachments(api: gmail_v1.Gmail, messageId: string, items: ForwardAttachment[]): Promise<EmailAttachment[]> {
-  return Promise.all(
-    items.map(async (item) => ({
-      filename: item.filename,
-      mimeType: item.mimeType,
-      contentBase64: await resolveForwardBytes(api, messageId, item),
-    }))
-  );
-}
+/**
+ * Resolves both the inline-image and regular-attachment byte sets for a
+ * forward in one pass, fetching at most 5 attachments concurrently (the same
+ * limit used elsewhere in this file) rather than the uncapped parallelism of
+ * Promise.all. A rejection from any single fetch fails the whole forward —
+ * the original Promise.all-based resolvers had the same fail-fast behavior,
+ * and a forward missing one of its attachments isn't a forward worth sending
+ * silently.
+ */
+async function resolveForwardLeaves(
+  api: gmail_v1.Gmail,
+  messageId: string,
+  inlineItems: ForwardAttachment[],
+  attachmentItems: ForwardAttachment[]
+): Promise<{ inlineImages: InlineImagePart[]; attachments: EmailAttachment[] }> {
+  const combined = [...inlineItems, ...attachmentItems];
+  const settled = await withConcurrencyLimit(combined, 5, (item) => resolveForwardBytes(api, messageId, item));
+  const failure = settled.find((r): r is PromiseRejectedResult => r.status === "rejected");
+  if (failure) throw failure.reason;
+  const bytes = (settled as PromiseFulfilledResult<string>[]).map((r) => r.value);
 
-async function resolveForwardInlineImages(api: gmail_v1.Gmail, messageId: string, items: ForwardAttachment[]): Promise<InlineImagePart[]> {
-  return Promise.all(
-    items.map(async (item) => ({
-      filename: item.filename,
-      mimeType: item.mimeType,
-      contentBase64: await resolveForwardBytes(api, messageId, item),
-      contentId: item.contentId || "",
-    }))
-  );
+  const inlineImages = inlineItems.map((item, i) => ({
+    filename: item.filename,
+    mimeType: item.mimeType,
+    contentBase64: bytes[i],
+    contentId: item.contentId || "",
+  }));
+  const attachments = attachmentItems.map((item, i) => ({
+    filename: item.filename,
+    mimeType: item.mimeType,
+    contentBase64: bytes[inlineItems.length + i],
+  }));
+  return { inlineImages, attachments };
 }
 
 /**
@@ -321,12 +336,26 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     const parsed = parseForwardContent(original.data.payload);
     const selected = selectForwardAttachments(parsed, includeAttachments);
 
+    // Cheap pre-download size estimate from Gmail's already-known body.size
+    // on each selected part, before fetching a single attachment byte — a
+    // forward that's already way over the limit shouldn't cost a multi-MB
+    // download just to be refused afterward.
+    const selectedParts = [...selected.inlineImages, ...selected.attachments];
+    const bodyBytes = Buffer.byteLength(parsed.text, "utf-8") + Buffer.byteLength(parsed.html, "utf-8");
+    const estimate = estimateForwardSize(selectedParts, bodyBytes);
+    if (!estimate.ok) {
+      return textResult({
+        error: `Forward is too large to send: an estimated ${estimate.estimatedBytes} bytes, over Gmail's ${estimate.limitBytes}-byte send limit, before even fetching attachment bytes.`,
+        estimatedBytes: estimate.estimatedBytes,
+        limitBytes: estimate.limitBytes,
+        largestAttachments: largestAttachments(selectedParts.map((a) => ({ filename: a.filename, size: a.size }))),
+        suggestion: "Retry with includeAttachments:false to drop regular attachments (inline images are always kept, since they're part of the body).",
+      });
+    }
+
     // Only fetch bytes for what we're actually keeping — a dropped attachment
     // (includeAttachments:false) never costs a network round trip.
-    const [inlineImages, attachments] = await Promise.all([
-      resolveForwardInlineImages(api, messageId, selected.inlineImages),
-      resolveForwardAttachments(api, messageId, selected.attachments),
-    ]);
+    const { inlineImages, attachments } = await resolveForwardLeaves(api, messageId, selected.inlineImages, selected.attachments);
 
     let signature: { text: string; html: string } | undefined;
     let signatureWarning: string | undefined;
@@ -334,7 +363,10 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       try {
         const sendAsRes = await api.users.settings.sendAs.list({ userId: "me" });
         const target = pickSendAs(sendAsRes.data.sendAs || []);
-        if (target?.signature) signature = { html: target.signature, text: htmlToText(target.signature) };
+        // Uncapped: a signature is never long enough to need the 50k display
+        // cap, but htmlToText's truncation note has no business ending up
+        // inside an outgoing message if it somehow were.
+        if (target?.signature) signature = { html: target.signature, text: htmlToText(target.signature, Infinity) };
       } catch (err) {
         // The signature is a nice-to-have on a forward, not a requirement —
         // a lookup failure shouldn't block it, but the caller is told it was skipped.
@@ -357,14 +389,11 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       references: messageIdHeader ? buildReferencesChain(references, messageIdHeader) : undefined,
     });
 
-    const encodedRaw = encodeBase64Url(raw);
-    const sizeCheck = checkForwardRawSize(encodedRaw);
+    const sizeCheck = checkForwardRawSize(raw);
     if (!sizeCheck.ok) {
-      const biggest = largestAttachments(
-        [...selected.inlineImages, ...selected.attachments].map((a) => ({ filename: a.filename, size: a.size }))
-      );
+      const biggest = largestAttachments(selectedParts.map((a) => ({ filename: a.filename, size: a.size })));
       return textResult({
-        error: `Forward is too large to send: the encoded message is ${sizeCheck.totalBytes} bytes, over Gmail's ${sizeCheck.limitBytes}-byte send limit.`,
+        error: `Forward is too large to send: the MIME message is ${sizeCheck.totalBytes} bytes, over Gmail's ${sizeCheck.limitBytes}-byte send limit.`,
         totalBytes: sizeCheck.totalBytes,
         limitBytes: sizeCheck.limitBytes,
         largestAttachments: biggest,
@@ -372,13 +401,15 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       });
     }
 
+    const warnings = [signatureWarning, ...parsed.warnings].filter((w): w is string => !!w);
+    const encodedRaw = encodeBase64Url(raw);
     const threadId = original.data.threadId || undefined;
     if (asDraft) {
       const res = await api.users.drafts.create({ userId: "me", requestBody: { message: { raw: encodedRaw, threadId } } });
-      return textResult({ draftId: res.data.id, messageId: res.data.message?.id, threadId: res.data.message?.threadId, ...(signatureWarning && { warning: signatureWarning }) });
+      return textResult({ draftId: res.data.id, messageId: res.data.message?.id, threadId: res.data.message?.threadId, ...(warnings.length && { warning: warnings.join(" ") }) });
     }
     const res = await api.users.messages.send({ userId: "me", requestBody: { raw: encodedRaw, threadId } });
-    return textResult({ id: res.data.id, threadId: res.data.threadId, ...(signatureWarning && { warning: signatureWarning }) });
+    return textResult({ id: res.data.id, threadId: res.data.threadId, ...(warnings.length && { warning: warnings.join(" ") }) });
   });
 
   server.tool("gmail_modify_email", "Modify email labels (add/remove)", {
