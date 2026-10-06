@@ -119,7 +119,11 @@ export function parseForwardContent(payload: gmail_v1.Schema$MessagePart | undef
   const result: ParsedForwardContent = { text: "", html: "", inlineImages: [], attachments: [] };
   if (!payload) return result;
 
-  function walk(part: gmail_v1.Schema$MessagePart): void {
+  // text/calendar parts that are a body alternative of an invite/RSVP, kept
+  // aside so they can be dropped when the same .ics is also attached.
+  const calendarAlternatives: ForwardAttachment[] = [];
+
+  function walk(part: gmail_v1.Schema$MessagePart, parentMimeType?: string): void {
     const isLeafFile = !!part.filename && part.filename.length > 0 && (!!part.body?.attachmentId || !!part.body?.data);
     if (isLeafFile) {
       const contentId = getHeader(part.headers, "content-id") || undefined;
@@ -135,6 +139,7 @@ export function parseForwardContent(payload: gmail_v1.Schema$MessagePart | undef
         contentId,
       };
       if (contentId) result.inlineImages.push(entry);
+      else if (entry.mimeType === "text/calendar" && parentMimeType === "multipart/alternative") calendarAlternatives.push(entry);
       else result.attachments.push(entry);
       return;
     }
@@ -149,11 +154,17 @@ export function parseForwardContent(payload: gmail_v1.Schema$MessagePart | undef
     }
 
     if (part.parts) {
-      for (const child of part.parts) walk(child);
+      for (const child of part.parts) walk(child, part.mimeType || undefined);
     }
   }
 
   walk(payload);
+  // Calendar mail (e.g. Google Calendar) carries the same invite.ics twice: as a
+  // text/calendar body alternative and as an attachment. Forward it once.
+  for (const cal of calendarAlternatives) {
+    const attachedToo = result.attachments.some((a) => a.filename === cal.filename && a.size === cal.size);
+    if (!attachedToo) result.attachments.push(cal);
+  }
   return result;
 }
 

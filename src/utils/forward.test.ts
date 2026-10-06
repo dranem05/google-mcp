@@ -198,6 +198,36 @@ describe("parseForwardContent", () => {
     expect(parsed.attachments).toHaveLength(1);
     expect(parsed.attachments[0].filename).toBe("archive.zip");
   });
+
+  // Shape of a Google Calendar RSVP: the same invite.ics as a text/calendar body
+  // alternative and as an application/ics attachment.
+  function calendarPayload(withAttachedCopy: boolean): gmail_v1.Schema$MessagePart {
+    const ics = { attachmentId: "att-ics", size: 1907 };
+    return {
+      mimeType: "multipart/mixed",
+      parts: [
+        {
+          mimeType: "multipart/alternative",
+          parts: [
+            { mimeType: "text/plain", body: { data: b64url("Jane accepted") } },
+            { mimeType: "text/html", body: { data: b64url("<p>Jane accepted</p>") } },
+            { mimeType: "text/calendar", filename: "invite.ics", body: ics },
+          ],
+        },
+        ...(withAttachedCopy ? [{ mimeType: "application/ics", filename: "invite.ics", body: ics }] : []),
+      ],
+    };
+  }
+
+  it("forwards a calendar invite's .ics once when it is both a body alternative and an attachment", () => {
+    const parsed = parseForwardContent(calendarPayload(true));
+    expect(parsed.attachments.map((a) => a.mimeType)).toEqual(["application/ics"]);
+  });
+
+  it("keeps a calendar body alternative as the attachment when there is no attached copy", () => {
+    const parsed = parseForwardContent(calendarPayload(false));
+    expect(parsed.attachments.map((a) => `${a.mimeType} ${a.filename}`)).toEqual(["text/calendar invite.ics"]);
+  });
 });
 
 describe("selectForwardAttachments", () => {
