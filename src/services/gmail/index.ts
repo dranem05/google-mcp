@@ -329,14 +329,16 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     ]);
 
     let signature: { text: string; html: string } | undefined;
+    let signatureWarning: string | undefined;
     if (includeSignature) {
       try {
         const sendAsRes = await api.users.settings.sendAs.list({ userId: "me" });
         const target = pickSendAs(sendAsRes.data.sendAs || []);
         if (target?.signature) signature = { html: target.signature, text: htmlToText(target.signature) };
-      } catch {
+      } catch (err) {
         // The signature is a nice-to-have on a forward, not a requirement —
-        // a missing scope or any other lookup failure shouldn't block it.
+        // a lookup failure shouldn't block it, but the caller is told it was skipped.
+        signatureWarning = `Signature omitted: lookup failed (${err instanceof Error ? err.message : String(err)}).`;
       }
     }
 
@@ -373,10 +375,10 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     const threadId = original.data.threadId || undefined;
     if (asDraft) {
       const res = await api.users.drafts.create({ userId: "me", requestBody: { message: { raw: encodedRaw, threadId } } });
-      return textResult({ draftId: res.data.id, messageId: res.data.message?.id, threadId: res.data.message?.threadId });
+      return textResult({ draftId: res.data.id, messageId: res.data.message?.id, threadId: res.data.message?.threadId, ...(signatureWarning && { warning: signatureWarning }) });
     }
     const res = await api.users.messages.send({ userId: "me", requestBody: { raw: encodedRaw, threadId } });
-    return textResult({ id: res.data.id, threadId: res.data.threadId });
+    return textResult({ id: res.data.id, threadId: res.data.threadId, ...(signatureWarning && { warning: signatureWarning }) });
   });
 
   server.tool("gmail_modify_email", "Modify email labels (add/remove)", {
