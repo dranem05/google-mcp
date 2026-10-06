@@ -145,6 +145,34 @@ function renderAttachmentPart(att: EmailAttachment): string {
   );
 }
 
+/** An inline image part (e.g. a forwarded `<img src="cid:...">`): an attachment plus the Content-ID header that cid: references in the HTML body point at. */
+export interface InlineImagePart extends EmailAttachment {
+  /** RFC 2392 Content-ID header value. Normalized to include the angle brackets regardless of how it was supplied. */
+  contentId: string;
+}
+
+/** Wraps a bare id in angle brackets if it doesn't already have them, since RFC 2392 Content-ID values are always delimited. */
+function normalizeContentId(id: string): string {
+  const trimmed = sanitizeHeaderValue(id);
+  if (!trimmed) return trimmed;
+  return trimmed.startsWith("<") ? trimmed : `<${trimmed}>`;
+}
+
+/** Renders one inline image as a base64 MIME part with Content-ID + Content-Disposition: inline, so cid: references in the HTML body resolve. */
+function renderInlineImagePart(img: InlineImagePart): string {
+  const filename = sanitizeHeaderValue(img.filename).replace(/"/g, "");
+  const mimeType = sanitizeHeaderValue(img.mimeType) || "application/octet-stream";
+  const contentId = normalizeContentId(img.contentId);
+  const body = wrapBase64(img.contentBase64.replace(/\s+/g, ""));
+  return (
+    `Content-Type: ${mimeType}${filename ? `; name="${filename}"` : ""}\r\n` +
+    `Content-Transfer-Encoding: base64\r\n` +
+    `Content-ID: ${contentId}\r\n` +
+    `Content-Disposition: inline${filename ? `; filename="${filename}"` : ""}\r\n\r\n` +
+    body
+  );
+}
+
 export function buildRawEmail(opts: {
   to: string[];
   subject: string;
@@ -157,6 +185,8 @@ export function buildRawEmail(opts: {
   references?: string;
   mimeType?: string;
   attachments?: EmailAttachment[];
+  /** Inline (cid:) images referenced from htmlBody. Wraps the body part in multipart/related, Gmail's own shape for this. */
+  inlineImages?: InlineImagePart[];
 }): string {
   const headers: string[] = [];
 
@@ -174,19 +204,34 @@ export function buildRawEmail(opts: {
 
   const bodyPart = renderBodyPart(opts);
 
-  // With attachments, wrap the body part + each attachment in multipart/mixed.
-  // The "mixed_"/"alt_" boundary prefixes contain "_" (not in the base64
-  // alphabet), so a boundary delimiter can never collide with encoded content.
+  // Inline images wrap the body part in multipart/related so cid: references
+  // in the HTML keep resolving. Skipped entirely when there are none, so the
+  // no-inline-images path (every existing caller) is untouched.
+  const contentPart = opts.inlineImages?.length
+    ? (() => {
+        const boundary = `related_${Date.now()}`;
+        const parts = [bodyPart, ...opts.inlineImages!.map(renderInlineImagePart)];
+        return (
+          `Content-Type: multipart/related; boundary="${boundary}"\r\n\r\n` +
+          parts.map((p) => `--${boundary}\r\n${p}`).join("\r\n") +
+          `\r\n--${boundary}--`
+        );
+      })()
+    : bodyPart;
+
+  // With attachments, wrap the content part + each attachment in multipart/mixed.
+  // The "mixed_"/"alt_"/"related_" boundary prefixes contain "_" (not in the
+  // base64 alphabet), so a boundary delimiter can never collide with encoded content.
   if (opts.attachments?.length) {
     const boundary = `mixed_${Date.now()}`;
     headers.push(`Content-Type: multipart/mixed; boundary="${boundary}"`);
-    const parts = [bodyPart, ...opts.attachments.map(renderAttachmentPart)];
+    const parts = [contentPart, ...opts.attachments.map(renderAttachmentPart)];
     const body = parts.map((p) => `--${boundary}\r\n${p}`).join("\r\n") + `\r\n--${boundary}--`;
     return headers.join("\r\n") + "\r\n\r\n" + body;
   }
 
-  // No attachments: the body part's Content-* headers sit at the message top level.
-  return headers.join("\r\n") + "\r\n" + bodyPart;
+  // No attachments: the content part's Content-* headers sit at the message top level.
+  return headers.join("\r\n") + "\r\n" + contentPart;
 }
 
 /** RFC 822 headers of the message being replied to (values as returned by Gmail's metadata format). */
@@ -272,11 +317,20 @@ export function buildReplyHeaders(
   const trimmedSubject = original.subject.trim();
   const subject = /^re:/i.test(trimmedSubject) ? trimmedSubject : `Re: ${trimmedSubject}`;
 
-  const references = original.references
-    ? `${original.references.trim()} ${original.messageIdHeader}`.trim()
-    : original.messageIdHeader;
+  const references = buildReferencesChain(original.references, original.messageIdHeader);
 
   return { to, cc, subject, inReplyTo: original.messageIdHeader, references };
+}
+
+/**
+ * Extends a References chain with the message being threaded off of: appends
+ * messageIdHeader to the original References header, or falls back to just
+ * messageIdHeader when there was no prior chain (the first reply/forward in
+ * a thread). Shared by buildReplyHeaders and gmail_forward_email so both
+ * tools thread identically.
+ */
+export function buildReferencesChain(originalReferences: string, messageIdHeader: string): string {
+  return originalReferences ? `${originalReferences.trim()} ${messageIdHeader}`.trim() : messageIdHeader;
 }
 
 export interface AttachmentInfo {
