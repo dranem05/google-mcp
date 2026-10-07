@@ -42,3 +42,42 @@ describe("rfc822MessageId projections", () => {
     expect("rfc822MessageId" in pruneThreadMessage(noId)).toBe(false);
   });
 });
+
+describe("projection shapes", () => {
+  const b64 = (t: string) => Buffer.from(t).toString("base64url");
+  const headers = [
+    { name: "Subject", value: "hi" },
+    { name: "From", value: "a@example.com" },
+    { name: "To", value: "b@example.com" },
+    { name: "Date", value: "Mon, 1 Jan 2024 00:00:00 +0000" },
+    { name: "Message-ID", value: "<a@b.example>" },
+  ];
+  it("search hit projects exactly the expected fields", () => {
+    const hit = projectSearchHit({ id: "m1", threadId: "t1", snippet: "s", payload: { headers } });
+    expect(hit).toEqual({
+      id: "m1", threadId: "t1", snippet: "s", subject: "hi", from: "a@example.com",
+      date: "Mon, 1 Jan 2024 00:00:00 +0000", rfc822MessageId: "<a@b.example>",
+    });
+  });
+  it("thread message falls back to HTML when text/plain is only zero-width padding", () => {
+    const out = pruneThreadMessage({
+      id: "m1",
+      payload: {
+        mimeType: "multipart/alternative",
+        headers,
+        parts: [
+          { mimeType: "text/plain", body: { data: b64("\u200c \u200c \u200c") } },
+          { mimeType: "text/html", body: { data: b64("<p>Real content</p>") } },
+        ],
+      },
+    });
+    expect(out.body).toContain("Real content");
+  });
+  it("thread message truncates long bodies", () => {
+    const out = pruneThreadMessage({
+      id: "m1",
+      payload: { mimeType: "text/plain", headers, body: { data: b64("x".repeat(2500)) } },
+    });
+    expect(out.body).toBe(`${"x".repeat(2000)}\n\n[truncated]`);
+  });
+});
