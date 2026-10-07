@@ -209,6 +209,16 @@ describe("buildReplyHeaders", () => {
     expect(r.cc).toEqual(["carol@example.com", "dave@example.com"]);
   });
 
+  it("reply-all drops every self address when selfEmail is a list", () => {
+    const r = buildReplyHeaders(original, { replyAll: true, selfEmail: ["other@example.com", "ME@example.com"] });
+    expect(r.cc).toEqual(["carol@example.com", "dave@example.com"]);
+    const r2 = buildReplyHeaders(
+      { ...original, cc: "alias@example.com, dave@example.com" },
+      { replyAll: true, selfEmail: ["me@example.com", "alias@example.com"] }
+    );
+    expect(r2.cc).toEqual(["carol@example.com", "dave@example.com"]);
+  });
+
   it("does not double-prefix a subject that already starts with Re:", () => {
     const r = buildReplyHeaders({ ...original, subject: "RE: Project update" });
     expect(r.subject).toBe("RE: Project update");

@@ -250,18 +250,20 @@ export function parseAddressList(headerValue: string): string[] {
  */
 export function buildReplyHeaders(
   original: OriginalMessageHeaders,
-  opts: { replyAll?: boolean; selfEmail?: string } = {}
+  opts: { replyAll?: boolean; selfEmail?: string | string[] } = {}
 ): ReplyHeaders {
   const to = parseAddressList(original.from);
   const senderLower = new Set(to.map((a) => a.toLowerCase()));
-  const selfLower = opts.selfEmail?.toLowerCase();
+  const selfLower = new Set(
+    [opts.selfEmail ?? []].flat().map((a) => a.toLowerCase())
+  );
 
   const cc: string[] = [];
   if (opts.replyAll) {
     const seen = new Set<string>();
     for (const addr of [...parseAddressList(original.to), ...parseAddressList(original.cc)]) {
       const lower = addr.toLowerCase();
-      if (lower === selfLower) continue; // don't reply to yourself
+      if (selfLower.has(lower)) continue; // don't reply to yourself
       if (senderLower.has(lower)) continue; // already in To
       if (seen.has(lower)) continue;
       seen.add(lower);

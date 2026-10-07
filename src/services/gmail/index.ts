@@ -104,14 +104,37 @@ export function pickSendAs(
  */
 export function resolveFromAddress(from: string, sendAsList: gmail_v1.Schema$SendAs[]): string {
   const addr = extractEmailAddress(from).toLowerCase();
+  // Gmail leaves a "pending" alias unverified and silently rewrites From to the
+  // default address, so treat it as unusable. The primary address carries no
+  // verificationStatus and stays valid.
+  const isPending = (s: gmail_v1.Schema$SendAs) => s.verificationStatus === "pending";
   const match = sendAsList.find((s) => s.sendAsEmail?.toLowerCase() === addr);
+  if (match && isPending(match)) {
+    const valid = sendAsList.filter((s) => !isPending(s)).map((s) => s.sendAsEmail).filter(Boolean).join(", ");
+    throw new Error(
+      `"${from}" is a send-as alias that is still pending verification, so Gmail would silently send from the default address instead. Valid aliases: ${valid || "(none configured)"}.`
+    );
+  }
   if (!match) {
-    const valid = sendAsList.map((s) => s.sendAsEmail).filter(Boolean).join(", ");
+    const valid = sendAsList.filter((s) => !isPending(s)).map((s) => s.sendAsEmail).filter(Boolean).join(", ");
     throw new Error(
       `"${from}" is not a verified send-as address on this account. Valid aliases: ${valid || "(none configured)"}.`
     );
   }
-  return match.displayName ? `${match.displayName} <${match.sendAsEmail}>` : match.sendAsEmail!;
+  return match.displayName ? `${formatDisplayName(match.displayName)} <${match.sendAsEmail}>` : match.sendAsEmail!;
+}
+
+/**
+ * Renders a display name for an address header. Names containing RFC 5322
+ * specials (or whitespace-only edge cases) must be a quoted-string, otherwise
+ * e.g. "Doe, Jane <a@b.c>" parses as two mailboxes. `"` and `\` are
+ * backslash-escaped. Non-ASCII passes through as raw UTF-8, matching how
+ * buildRawEmail's address headers treat it.
+ */
+export function formatDisplayName(name: string): string {
+  const clean = name.replace(/[\r\n]+/g, " ").trim();
+  if (!/[()<>[\]:;@\\,."]/.test(clean)) return clean;
+  return `"${clean.replace(/[\\"]/g, "\\$&")}"`;
 }
 
 const GMAIL_SETTINGS_SCOPE = "https://www.googleapis.com/auth/gmail.settings.basic";
@@ -278,11 +301,15 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
       to: getHeader(headers, "to"),
       cc: getHeader(headers, "cc"),
     };
-    const selfEmail = opts.replyAll ? await getSelfEmail() : undefined;
+    const from = await resolveFromParam(opts.from);
+    // Exclude both the primary address and the alias we're replying from, so a
+    // reply-all sent as an alias doesn't CC that alias.
+    const selfEmail = opts.replyAll
+      ? [await getSelfEmail(), from ? from.match(/<([^<>]+)>\s*$/)?.[1] ?? from : undefined].filter((a): a is string => !!a)
+      : undefined;
     const reply = buildReplyHeaders(originalHeaders, { replyAll: opts.replyAll, selfEmail });
     const cc = [...reply.cc, ...(opts.cc || [])];
     const attachments = await resolveAttachments(opts.attachments);
-    const from = await resolveFromParam(opts.from);
 
     const raw = encodeBase64Url(buildRawEmail({
       to: reply.to,
