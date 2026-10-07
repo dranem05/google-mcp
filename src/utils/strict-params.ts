@@ -16,15 +16,20 @@ import { z } from "zod";
  * `.min(1)` survive) and parented to the original, so registry metadata
  * (`.describe()`) is inherited.
  *
- * Objects that already declare a catchall (`.passthrough()`, `.strict()`,
- * `.catchall()`) are an explicit opt-out and are left alone; `assertToolsStrict`
+ * Objects that declare a non-`never` catchall (`.passthrough()`, `z.looseObject`,
+ * `.catchall(x)`) are an explicit opt-out and are left alone; an object that is
+ * already `.strict()` (catchall `never`) is still walked, so strictness below it
+ * is enforced too; `assertToolsStrict`
  * applies the same policy. A tool whose top-level schema has no properties at
  * all stays lenient (extra keys are ignored, not rejected): some clients send a
  * placeholder such as `random_string` to no-arg tools.
  *
  * Pipes (`.transform()`, `.pipe()`) are traversed through their input side
- * (`def.in`), which is what the raw arguments are parsed by; the output side is
- * not an input shape. Node types this walker does not know how to traverse
+ * (`def.in`), which is what the raw arguments are parsed by. The output side
+ * is not walked: in `z.string().transform(JSON.parse).pipe(z.object(...))` the
+ * object after the pipe stays as written, so declare it `.strict()` yourself.
+ * `.catch()` is deliberately not traversed (it throws below): a strict object
+ * under `.catch()` would turn a typo into a silent fallback to the catch value. Node types this walker does not know how to traverse
  * (`z.preprocess`, whose input side is a bare transform, `z.lazy`,
  * `z.intersection`, `z.tuple`, and anything else added later) might
  * hide an object below them, so the walker cannot vouch for strictness past
@@ -54,7 +59,6 @@ const INNER_TYPE_WRAPPERS = new Set([
   "prefault",
   "nonoptional",
   "readonly",
-  "catch",
 ]);
 
 /** Leaf types: nothing below them can carry object keys. */
@@ -113,7 +117,7 @@ export function deepStrict(
   const type: string = def.type;
 
   if (type === "object") {
-    if (def.catchall !== undefined) {
+    if (def.catchall !== undefined && def.catchall?._zod?.def?.type !== "never") {
       stats.explicitCatchall++;
       return schema;
     }

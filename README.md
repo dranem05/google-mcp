@@ -48,7 +48,7 @@ By default every family registers. `--families gmail,calendar` restricts the ser
 
 ## Operational defaults
 
-- **Strict parameters** — unknown or misspelled tool parameters are rejected with an MCP `-32602` validation error instead of being silently dropped. This applies to nested objects too (including objects inside arrays). Tools that take no parameters ignore extra keys (some clients send placeholders such as `random_string`). A schema that explicitly declares `passthrough`/`looseObject`/`catchall` is exempt.
+- **Strict parameters** — unknown or misspelled tool parameters are rejected instead of being silently dropped: the call returns a tool error whose text starts `MCP error -32602: Input validation error`. This applies to nested objects too (including objects inside arrays). Tools that take no parameters ignore extra keys (some clients send placeholders such as `random_string`). A schema that explicitly declares `passthrough`/`looseObject`/`catchall` is exempt; `.strict()` objects are walked like any other.
 - **Compact output** — tool results are unindented JSON; responses are pruned to the fields a model actually needs (list views trim heavyweight nested objects).
 - **Size caps** — `docs_read_document` caps output at 50k characters (raise via `maxLength`); Gmail message bodies are capped at 50k characters with a truncation note; Sheets reads fail loudly past a 10,000-cell cap (narrow the range and retry); Gmail attachment downloads over 2 MB are written to disk instead of returned inline (Drive downloads inline up to 10 MB).
 - **Pagination** — list-style tools accept a `pageToken` and return a `nextPageToken` when more results exist; tools that fan out to multiple underlying lists use a single composite token with the same contract.

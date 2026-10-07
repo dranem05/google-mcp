@@ -138,3 +138,16 @@ describe("deepStrict", () => {
     expect(stats.explicitCatchall).toBe(1);
   });
 });
+
+describe("deepStrict edge cases", () => {
+  it("keeps walking below an object that is already .strict()", () => {
+    const out = deepStrict(z.object({ o: z.strictObject({ n: z.object({ x: z.string() }) }) }), newStrictifyStats());
+    expect(out.safeParse({ o: { n: { x: "a" } } }).success).toBe(true);
+    expect(out.safeParse({ o: { n: { x: "a", typo: 1 } } }).success).toBe(false);
+  });
+  it("refuses .catch() rather than turning a typo into a silent fallback", () => {
+    expect(() =>
+      deepStrict(z.object({ o: z.object({ a: z.string() }).catch({ a: "DEFAULT" }) }), newStrictifyStats())
+    ).toThrow(/catch/);
+  });
+});
