@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
-import { calendar_v3 } from "googleapis";
-import { formatEventForList } from "./index.js";
+import { describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+import { google, calendar_v3 } from "googleapis";
+import { formatEventForList, registerCalendarTools } from "./index.js";
 
 describe("formatEventForList", () => {
   const baseEvent: calendar_v3.Schema$Event = {
@@ -64,5 +65,47 @@ describe("formatEventForList", () => {
   it("handles an event with no attendees", () => {
     const result = formatEventForList({ ...baseEvent, attendees: undefined }, false);
     expect(result.attendees).toBeUndefined();
+  });
+});
+
+describe("calendar attendee schema (create/update)", () => {
+  type Handler = (opts: Record<string, unknown>) => Promise<unknown>;
+  const setup = async () => {
+    const patch = vi.fn().mockResolvedValue({ data: { id: "evt1" } });
+    vi.spyOn(google, "calendar").mockReturnValue({ events: { patch } } as never);
+    const tools = new Map<string, { shape: z.ZodRawShape; handler: Handler }>();
+    const server = { tool: (name: string, _d: string, shape: z.ZodRawShape, handler: Handler) => { tools.set(name, { shape, handler }); } };
+    registerCalendarTools(server as never, { auth: {} as never });
+    return { patch, tools };
+  };
+
+  // Shape of calendar_get_event output (Google's raw attendee objects).
+  const readAttendees = [
+    { email: "a@example.com", displayName: "A", responseStatus: "accepted", self: true, organizer: true, id: "123" },
+    { email: "b@example.com", optional: true, responseStatus: "needsAction", comment: "maybe", additionalGuests: 2 },
+    { email: "room@example.com", resource: true, responseStatus: "accepted" },
+  ];
+
+  it("update_event accepts get_event-shaped attendees and sends them unchanged", async () => {
+    const { patch, tools } = await setup();
+    const t = tools.get("calendar_update_event")!;
+    const parsed = z.object(t.shape).parse({ calendarId: "primary", eventId: "evt1", attendees: readAttendees });
+    await t.handler(parsed);
+    expect(patch.mock.calls[0][0].requestBody.attendees).toEqual(readAttendees);
+  });
+
+  it("update_event accepts optional on an attendee", async () => {
+    const { patch, tools } = await setup();
+    const t = tools.get("calendar_update_event")!;
+    const parsed = z.object(t.shape).parse({ calendarId: "primary", eventId: "evt1", attendees: [{ email: "b@example.com", optional: true }] });
+    await t.handler(parsed);
+    expect(patch.mock.calls[0][0].requestBody.attendees).toEqual([{ email: "b@example.com", optional: true }]);
+  });
+
+  it("create_event and update_event share the same attendee schema", async () => {
+    const { tools } = await setup();
+    const c = z.object(tools.get("calendar_create_event")!.shape).shape.attendees;
+    const u = z.object(tools.get("calendar_update_event")!.shape).shape.attendees;
+    for (const sch of [c, u]) expect(sch.safeParse(readAttendees).success).toBe(true);
   });
 });

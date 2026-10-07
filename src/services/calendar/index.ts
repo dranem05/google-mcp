@@ -8,6 +8,21 @@ import { proposeTimes, parseHhMm, type Interval } from "../../utils/propose-time
 
 import { calendar_v3 } from "googleapis";
 
+// Mirrors Google Calendar v3 Event attendee resource. Shared by create and
+// update so an attendee list read via calendar_get_event can be written back.
+const attendeeSchema = z.object({
+  email: z.string().describe("Attendee email address (required when adding an attendee)"),
+  displayName: z.string().optional().describe("Attendee display name"),
+  optional: z.boolean().optional().describe("Whether this is an optional attendee"),
+  responseStatus: z.string().optional().describe("Attendee's response status: needsAction, declined, tentative or accepted"),
+  comment: z.string().optional().describe("Attendee's response comment"),
+  additionalGuests: z.number().int().optional().describe("Number of additional guests the attendee is bringing"),
+  resource: z.boolean().optional().describe("Whether the attendee is a resource (e.g. a room). Can only be set when the attendee is first added"),
+  id: z.string().optional().describe("Read-only, server-managed profile ID; accepted so calendar_get_event output round-trips, ignored by Google"),
+  self: z.boolean().optional().describe("Read-only, server-managed; accepted so calendar_get_event output round-trips, ignored by Google"),
+  organizer: z.boolean().optional().describe("Read-only, server-managed; accepted so calendar_get_event output round-trips, ignored by Google"),
+});
+
 const remindersSchema = z.object({
   useDefault: z.boolean(),
   overrides: z.array(z.object({ method: z.enum(["email", "popup"]).default("popup"), minutes: z.number() })).optional(),
@@ -148,7 +163,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     end: z.string().describe(`End time (ISO 8601 datetime or date for all-day). ${ALL_DAY_END_NOTE}`),
     description: z.string().optional(),
     location: z.string().optional(),
-    attendees: z.array(z.object({ email: z.string(), displayName: z.string().optional(), optional: z.boolean().optional() })).optional(),
+    attendees: z.array(attendeeSchema).optional(),
     timeZone: z.string().optional().describe("IANA timezone for a timed event. If omitted and start/end don't carry a UTC offset, defaults to the calendar's own timezone."),
     recurrence: z.array(z.string()).optional().describe("RFC5545 recurrence rules"),
     conferenceData: z.object({
@@ -266,7 +281,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     end: z.string().optional().describe(`New end time (ISO 8601 datetime or date for all-day). ${ALL_DAY_END_NOTE}`),
     description: z.string().optional(),
     location: z.string().optional(),
-    attendees: z.array(z.object({ email: z.string(), displayName: z.string().optional() })).optional(),
+    attendees: z.array(attendeeSchema).optional().describe("Replaces the attendee list. To add or remove attendees, pass the list from calendar_get_event with your additions/removals."),
     timeZone: z.string().optional().describe("IANA timezone to apply to a new start/end. If omitted, the event's existing timezone is preserved."),
     sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
     colorId: z.string().optional(),
