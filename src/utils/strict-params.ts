@@ -17,9 +17,16 @@ import { z } from "zod";
  * (`.describe()`) is inherited.
  *
  * Objects that already declare a catchall (`.passthrough()`, `.strict()`,
- * `.catchall()`) are an explicit choice and are left alone. Node types this
- * walker does not know how to traverse (`z.preprocess`/`.transform`/`.pipe`,
- * `z.lazy`, `z.intersection`, `z.tuple`, and anything else added later) might
+ * `.catchall()`) are an explicit opt-out and are left alone; `assertToolsStrict`
+ * applies the same policy. A tool whose top-level schema has no properties at
+ * all stays lenient (extra keys are ignored, not rejected): some clients send a
+ * placeholder such as `random_string` to no-arg tools.
+ *
+ * Pipes (`.transform()`, `.pipe()`) are traversed through their input side
+ * (`def.in`), which is what the raw arguments are parsed by; the output side is
+ * not an input shape. Node types this walker does not know how to traverse
+ * (`z.preprocess`, whose input side is a bare transform, `z.lazy`,
+ * `z.intersection`, `z.tuple`, and anything else added later) might
  * hide an object below them, so the walker cannot vouch for strictness past
  * that point — it throws immediately, naming the tool and the path, rather
  * than registering a tool whose nested strictness is merely unverified.
@@ -133,6 +140,11 @@ export function deepStrict(
     return options.every((o, i) => o === def.options[i]) ? schema : cloneWith(schema, { options });
   }
 
+  if (type === "pipe") {
+    const input = deepStrict(def.in, stats, toolName, path);
+    return input === def.in ? schema : cloneWith(schema, { in: input });
+  }
+
   if (type === "record") {
     const valueType = deepStrict(def.valueType, stats, toolName, [...path, "{}"]);
     return valueType === def.valueType ? schema : cloneWith(schema, { valueType });
@@ -145,6 +157,11 @@ export function deepStrict(
     );
   }
   return schema;
+}
+
+/** True for an object schema with no properties and no catchall (a no-arg tool). */
+export function isZeroParamObject(def: AnySchema): boolean {
+  return def?.type === "object" && def.catchall === undefined && Object.keys(def.shape ?? {}).length === 0;
 }
 
 /**
@@ -171,5 +188,6 @@ export function strictifyRegisteredSchema(
         `the registration choke point cannot make it strict`
     );
   }
+  if (isZeroParamObject(def)) return inputSchema; // no-arg tool: stay lenient
   return deepStrict(inputSchema, stats, toolName);
 }

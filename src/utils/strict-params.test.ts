@@ -45,9 +45,56 @@ describe("strict tool parameters (registration choke point)", () => {
     expect(r.data.mimeType).toBe("text/plain");
   });
 
-  it("rejects any argument to a zero-parameter tool", () => {
-    expect(schemaOf(server, "gmail_list_labels").safeParse({}).success).toBe(true);
-    expect(schemaOf(server, "gmail_list_labels").safeParse({ random_string: "x" }).success).toBe(false);
+  it("accepts and ignores extra keys on a zero-parameter tool", () => {
+    const schema = schemaOf(server, "gmail_list_labels");
+    expect(schema.safeParse({}).success).toBe(true);
+    const r = schema.safeParse({ random_string: "x" });
+    expect(r.success).toBe(true);
+    expect(r.data).toEqual({});
+    expect(() => assertToolsStrict(server)).not.toThrow();
+  });
+
+  it("assertToolsStrict counts a zero-property object as a no-arg tool", () => {
+    const s = createServer(makeCtx(), { families: ["meet"] });
+    s.registerTool("noargs-bypass", { inputSchema: {} }, async () => ({ content: [] }));
+    expect(() => assertToolsStrict(s)).not.toThrow();
+  });
+
+  it("assertToolsStrict accepts an explicit top-level passthrough as an opt-out", () => {
+    const s = createServer(makeCtx(), { families: ["meet"] });
+    s.tool("loose", { a: z.string() }, async () => ({ content: [] }));
+    // simulate an explicit catchall schema registered by hand
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (s as any)._registeredTools["loose"].inputSchema = z.looseObject({ a: z.string() });
+    expect(() => assertToolsStrict(s)).not.toThrow();
+  });
+
+  it("assertToolsStrict names the missing private SDK internal", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(() => assertToolsStrict({} as any)).toThrow(/_registeredTools/);
+  });
+
+  it("registers a tool with a transformed parameter and still rejects unknown nested keys", () => {
+    const s = createServer(makeCtx(), { families: ["meet"] });
+    s.tool(
+      "pipe-ok",
+      { opts: z.object({ n: z.string() }).transform((o) => ({ n: o.n.toUpperCase() })) },
+      async () => ({ content: [] })
+    );
+    const schema = schemaOf(s, "pipe-ok");
+    expect(schema.safeParse({ opts: { n: "a" } }).data).toEqual({ opts: { n: "A" } });
+    expect(schema.safeParse({ opts: { n: "a", extra: 1 } }).success).toBe(false);
+    expect(() => assertToolsStrict(s)).not.toThrow();
+  });
+
+  it("leaves no loosely-registered tool behind when strictification throws", () => {
+    const s = createServer(makeCtx(), { families: ["meet"] });
+    expect(() =>
+      s.tool("lazy-gap", { o: z.lazy(() => z.object({ a: z.string() })) }, async () => ({ content: [] }))
+    ).toThrow(/lazy-gap/);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect(Object.keys((s as any)._registeredTools)).not.toContain("lazy-gap");
+    expect(() => assertToolsStrict(s)).not.toThrow();
   });
 
   it("fails the startup assertion when a tool bypasses the choke point", () => {

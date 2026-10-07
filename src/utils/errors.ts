@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
-import { newStrictifyStats, strictifyRegisteredSchema, type StrictifyStats } from "./strict-params.js";
+import { isZeroParamObject, newStrictifyStats, strictifyRegisteredSchema, type StrictifyStats } from "./strict-params.js";
 
 /** Shape of the pieces of a GaxiosError we read. Duck-typed so tests don't need a real GaxiosError. */
 interface GaxiosLikeError {
@@ -162,7 +162,14 @@ export function installToolErrorHandling(server: McpServer, opts: MapGoogleError
     // Post-processing the RegisteredTool avoids re-implementing the overload
     // parsing here, which is where a choke point could mis-register silently.
     const registered = original(...args);
-    registered.inputSchema = strictifyRegisteredSchema(args[0], registered.inputSchema, stats);
+    try {
+      registered.inputSchema = strictifyRegisteredSchema(args[0], registered.inputSchema, stats);
+    } catch (error) {
+      // The SDK has already registered the tool with its loose default schema;
+      // never leave that behind when strictification refuses.
+      registered.remove();
+      throw error;
+    }
     return registered;
   };
 }
@@ -171,21 +178,33 @@ export function installToolErrorHandling(server: McpServer, opts: MapGoogleError
 export const strictifyStats = new WeakMap<McpServer, StrictifyStats>();
 
 /**
- * Startup invariant: every registered tool either takes no arguments at all or
- * has a strict (unknown-keys-rejecting) top-level input schema. Catches any
- * registration that bypassed the patched `server.tool` (e.g. a future direct
- * `registerTool` call). Throws, so a violation fails at startup, not per call.
+ * Startup invariant: every registered tool either takes no arguments at all
+ * (no schema, or an object with no properties, which stays lenient on purpose)
+ * or has a strict top-level input schema. A top-level object that declares a
+ * catchall is accepted: `never` is what the choke point installs, and any other
+ * catchall (`.passthrough()` / `looseObject` / `.catchall(x)`) is a deliberate
+ * opt-out that `deepStrict` also leaves alone, so the two policies agree.
+ * Catches any registration that bypassed the patched `server.tool` (e.g. a
+ * future direct `registerTool` call). Throws, so a violation fails at startup,
+ * not per call.
  */
 export function assertToolsStrict(server: McpServer): { strict: number; noArgs: number } {
+  // `_registeredTools` is a private SDK field; fail clearly if an SDK upgrade moves it.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const tools = (server as any)._registeredTools as Record<string, { inputSchema?: any }>;
+  const tools = (server as any)._registeredTools as Record<string, { inputSchema?: any }> | undefined;
+  if (tools === undefined || tools === null || typeof tools !== "object") {
+    throw new Error(
+      "strict-params: McpServer._registeredTools (private SDK internal) is missing; the installed " +
+        "@modelcontextprotocol/sdk no longer matches what assertToolsStrict expects"
+    );
+  }
   let strict = 0;
   let noArgs = 0;
   const offenders: string[] = [];
   for (const [name, tool] of Object.entries(tools)) {
     const def = tool.inputSchema?._zod?.def;
-    if (tool.inputSchema === undefined) noArgs++;
-    else if (def?.type === "object" && def.catchall?._zod?.def?.type === "never") strict++;
+    if (tool.inputSchema === undefined || isZeroParamObject(def)) noArgs++;
+    else if (def?.type === "object" && def.catchall !== undefined) strict++;
     else offenders.push(name);
   }
   if (offenders.length > 0) {
