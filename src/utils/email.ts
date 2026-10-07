@@ -367,6 +367,33 @@ export function htmlToText(html: string, maxLength = DEFAULT_BODY_TEXT_MAX_LENGT
   return capTextLength(text, maxLength);
 }
 
+/**
+ * Characters that carry no content but are not stripped by String#trim():
+ * zero-width space/non-joiner/joiner, word joiner, combining grapheme joiner,
+ * Mongolian vowel separator. Newsletter platforms pad with these.
+ */
+const BLANK_CHARS = /[\s\u200B-\u200D\u2060\u034F\u180E]/gu;
+
+/**
+ * Pick the best readable body for a message.
+ *
+ * Prefers text/plain, but only when it actually has content. An HTML-only
+ * sender still emits a text/plain part, typically whitespace or zero-width
+ * padding; that stub is truthy, so a bare truthiness test returns it and
+ * discards the HTML alternative along with the whole message body.
+ *
+ * Both branches go through the same cap: htmlToText caps internally, and the
+ * trimmed plain text is capped here.
+ */
+export function bestBodyText(
+  body: { text: string; html: string },
+  maxLength = DEFAULT_BODY_TEXT_MAX_LENGTH,
+): string {
+  const text = body.text.trim();
+  if (text.replace(BLANK_CHARS, "") !== "") return capTextLength(text, maxLength);
+  return body.html ? htmlToText(body.html, maxLength) : "";
+}
+
 export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
   const headers = msg.payload?.headers;
   const body = extractBody(msg.payload);
@@ -381,9 +408,7 @@ export function formatMessage(msg: gmail_v1.Schema$Message): Record<string, unkn
     to: getHeader(headers, "to"),
     cc: getHeader(headers, "cc"),
     date: getHeader(headers, "date"),
-    // Both body kinds go through the same 50k cap: htmlToText caps internally,
-    // and plain text is capped here (previously it was returned in full).
-    body: body.text ? capTextLength(body.text) : body.html ? htmlToText(body.html) : "",
+    body: bestBodyText(body),
     ...(attachments.length > 0 ? { attachments } : {}),
   };
 }
