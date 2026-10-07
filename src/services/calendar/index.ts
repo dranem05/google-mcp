@@ -14,14 +14,28 @@ const attendeeSchema = z.object({
   email: z.string().describe("Attendee email address (required when adding an attendee)"),
   displayName: z.string().optional().describe("Attendee display name"),
   optional: z.boolean().optional().describe("Whether this is an optional attendee"),
-  responseStatus: z.string().optional().describe("Attendee's response status: needsAction, declined, tentative or accepted"),
-  comment: z.string().optional().describe("Attendee's response comment"),
-  additionalGuests: z.number().int().optional().describe("Number of additional guests the attendee is bringing"),
+  responseStatus: z.string().optional().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
+  comment: z.string().optional().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
+  additionalGuests: z.number().int().optional().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
   resource: z.boolean().optional().describe("Whether the attendee is a resource (e.g. a room). Can only be set when the attendee is first added"),
-  id: z.string().optional().describe("Read-only, server-managed profile ID; accepted so calendar_get_event output round-trips, ignored by Google"),
-  self: z.boolean().optional().describe("Read-only, server-managed; accepted so calendar_get_event output round-trips, ignored by Google"),
-  organizer: z.boolean().optional().describe("Read-only, server-managed; accepted so calendar_get_event output round-trips, ignored by Google"),
+  id: z.string().optional().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
+  self: z.boolean().optional().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
+  organizer: z.boolean().optional().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
 });
+
+// Forward only organizer-controlled fields. Attendee-owned (responseStatus,
+// comment, additionalGuests) and server-managed (id, self, organizer) fields
+// are accepted by the schema for round-tripping but never sent, so a stale
+// read cannot overwrite another attendee's RSVP.
+export function toWritableAttendees(attendees: z.infer<typeof attendeeSchema>[] | undefined): calendar_v3.Schema$EventAttendee[] | undefined {
+  return attendees?.map(({ email, displayName, optional, resource }) => {
+    const out: calendar_v3.Schema$EventAttendee = { email };
+    if (displayName !== undefined) out.displayName = displayName;
+    if (optional !== undefined) out.optional = optional;
+    if (resource !== undefined) out.resource = resource;
+    return out;
+  });
+}
 
 const remindersSchema = z.object({
   useDefault: z.boolean(),
@@ -204,7 +218,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
         location: opts.location,
         start: startField,
         end: endField,
-        attendees: opts.attendees,
+        attendees: toWritableAttendees(opts.attendees),
         recurrence: opts.recurrence,
         conferenceData: opts.conferenceData as unknown as undefined,
         reminders: opts.reminders,
@@ -299,7 +313,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     if (opts.summary !== undefined) requestBody.summary = opts.summary;
     if (opts.description !== undefined) requestBody.description = opts.description;
     if (opts.location !== undefined) requestBody.location = opts.location;
-    if (opts.attendees !== undefined) requestBody.attendees = opts.attendees;
+    if (opts.attendees !== undefined) requestBody.attendees = toWritableAttendees(opts.attendees);
     if (opts.colorId !== undefined) requestBody.colorId = opts.colorId;
     if (opts.recurrence !== undefined) requestBody.recurrence = opts.recurrence;
     if (opts.reminders !== undefined) requestBody.reminders = opts.reminders;

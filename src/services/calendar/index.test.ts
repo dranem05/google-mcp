@@ -86,12 +86,18 @@ describe("calendar attendee schema (create/update)", () => {
     { email: "room@example.com", resource: true, responseStatus: "accepted" },
   ];
 
-  it("update_event accepts get_event-shaped attendees and sends them unchanged", async () => {
+  const forwarded = [
+    { email: "a@example.com", displayName: "A" },
+    { email: "b@example.com", optional: true },
+    { email: "room@example.com", resource: true },
+  ];
+
+  it("update_event accepts get_event-shaped attendees and forwards only organizer-controlled fields", async () => {
     const { patch, tools } = await setup();
     const t = tools.get("calendar_update_event")!;
     const parsed = z.object(t.shape).parse({ calendarId: "primary", eventId: "evt1", attendees: readAttendees });
     await t.handler(parsed);
-    expect(patch.mock.calls[0][0].requestBody.attendees).toEqual(readAttendees);
+    expect(patch.mock.calls[0][0].requestBody.attendees).toEqual(forwarded);
   });
 
   it("update_event accepts optional on an attendee", async () => {
@@ -107,5 +113,21 @@ describe("calendar attendee schema (create/update)", () => {
     const c = z.object(tools.get("calendar_create_event")!.shape).shape.attendees;
     const u = z.object(tools.get("calendar_update_event")!.shape).shape.attendees;
     for (const sch of [c, u]) expect(sch.safeParse(readAttendees).success).toBe(true);
+  });
+});
+
+describe("calendar_create_event attendee forwarding", () => {
+  it("forwards only organizer-controlled attendee fields", async () => {
+    const insert = vi.fn().mockResolvedValue({ data: { id: "evt1" } });
+    vi.spyOn(google, "calendar").mockReturnValue({ events: { insert }, calendars: { get: vi.fn().mockResolvedValue({ data: { timeZone: "UTC" } }) } } as never);
+    const tools = new Map<string, { shape: z.ZodRawShape; handler: (o: Record<string, unknown>) => Promise<unknown> }>();
+    registerCalendarTools({ tool: (n: string, _d: string, shape: z.ZodRawShape, handler: never) => { tools.set(n, { shape, handler }); } } as never, { auth: {} as never });
+    const t = tools.get("calendar_create_event")!;
+    const parsed = z.object(t.shape).parse({
+      calendarId: "primary", summary: "x", start: "2026-07-06T10:00:00Z", end: "2026-07-06T11:00:00Z",
+      attendees: [{ email: "b@example.com", optional: true, responseStatus: "accepted", comment: "c", self: true }],
+    });
+    await t.handler(parsed);
+    expect(insert.mock.calls[0][0].requestBody.attendees).toEqual([{ email: "b@example.com", optional: true }]);
   });
 });
