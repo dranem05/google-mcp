@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { google, calendar_v3 } from "googleapis";
 import { formatEventForList, registerCalendarTools } from "./index.js";
@@ -68,6 +68,17 @@ describe("formatEventForList", () => {
   });
 });
 
+const ATTENDEE_KEYS = [
+  "additionalGuests", "comment", "displayName", "email", "id",
+  "optional", "organizer", "resource", "responseStatus", "self",
+] as const;
+// Compile-time: fails to typecheck if Schema$EventAttendee gains a key missing from ATTENDEE_KEYS.
+type MissingKeys = Exclude<keyof calendar_v3.Schema$EventAttendee, (typeof ATTENDEE_KEYS)[number]>;
+const _exhaustive: [MissingKeys] extends [never] ? true : never = true;
+void _exhaustive;
+
+afterEach(() => { vi.restoreAllMocks(); });
+
 describe("calendar attendee schema (create/update)", () => {
   type Handler = (opts: Record<string, unknown>) => Promise<unknown>;
   const setup = async () => {
@@ -108,11 +119,19 @@ describe("calendar attendee schema (create/update)", () => {
     expect(patch.mock.calls[0][0].requestBody.attendees).toEqual([{ email: "b@example.com", optional: true }]);
   });
 
-  it("create_event and update_event share the same attendee schema", async () => {
+  it("create_event and update_event use one identical attendee schema covering every EventAttendee key", async () => {
     const { tools } = await setup();
-    const c = z.object(tools.get("calendar_create_event")!.shape).shape.attendees;
-    const u = z.object(tools.get("calendar_update_event")!.shape).shape.attendees;
-    for (const sch of [c, u]) expect(sch.safeParse(readAttendees).success).toBe(true);
+    const elementOf = (name: string) => {
+      const field = tools.get(name)!.shape.attendees as z.ZodOptional<z.ZodArray<z.ZodObject<z.ZodRawShape>>>;
+      return field.unwrap().element;
+    };
+    const c = elementOf("calendar_create_event");
+    const u = elementOf("calendar_update_event");
+    expect(c).toBe(u);
+    expect(Object.keys(c.shape).sort()).toEqual([...ATTENDEE_KEYS].sort());
+    expect(Object.keys(u.shape).sort()).toEqual([...ATTENDEE_KEYS].sort());
+    // Google's `T | null` typings: round-trip-only fields accept null.
+    expect(c.safeParse({ email: "a@example.com", responseStatus: null, comment: null, additionalGuests: null, id: null, self: null, organizer: null }).success).toBe(true);
   });
 });
 
