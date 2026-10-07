@@ -14,25 +14,42 @@ const attendeeSchema = z.object({
   email: z.string().describe("Attendee email address (required when adding an attendee)"),
   displayName: z.string().optional().describe("Attendee display name"),
   optional: z.boolean().optional().describe("Whether this is an optional attendee"),
-  responseStatus: z.string().nullish().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
-  comment: z.string().nullish().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
-  additionalGuests: z.number().int().nullish().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
+  responseStatus: z.string().nullish().describe("Accepted for round-tripping, never taken from input; owned by the attendee. On update, an existing attendee's live value is preserved"),
+  comment: z.string().nullish().describe("Accepted for round-tripping, never taken from input; owned by the attendee. On update, an existing attendee's live value is preserved"),
+  additionalGuests: z.number().int().nullish().describe("Accepted for round-tripping, never taken from input; owned by the attendee. On update, an existing attendee's live value is preserved"),
   resource: z.boolean().optional().describe("Whether the attendee is a resource (e.g. a room). Can only be set when the attendee is first added"),
   id: z.string().nullish().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
   self: z.boolean().nullish().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
   organizer: z.boolean().nullish().describe("Accepted for round-tripping, not sent; owned by the attendee or by Google"),
 });
 
-// Forward only organizer-controlled fields. Attendee-owned (responseStatus,
-// comment, additionalGuests) and server-managed (id, self, organizer) fields
-// are accepted by the schema for round-tripping but never sent, so a stale
-// read cannot overwrite another attendee's RSVP.
-export function toWritableAttendees(attendees: z.infer<typeof attendeeSchema>[] | undefined): calendar_v3.Schema$EventAttendee[] | undefined {
+// Forward only organizer-controlled fields from the caller. Attendee-owned
+// (responseStatus, comment, additionalGuests) and server-managed (id, self,
+// organizer) fields are accepted by the schema for round-tripping but never
+// taken from input, so a stale read cannot overwrite live state.
+//
+// Omitting responseStatus does NOT protect existing RSVPs: events.patch with
+// an attendees list that lacks responseStatus resets every existing attendee to
+// needsAction. On update, pass `live` (the event's current attendees) so each
+// matching attendee (by case-insensitive email) carries over the live
+// responseStatus, comment and additionalGuests.
+export function toWritableAttendees(
+  attendees: z.infer<typeof attendeeSchema>[] | undefined,
+  live?: calendar_v3.Schema$EventAttendee[] | null,
+): calendar_v3.Schema$EventAttendee[] | undefined {
+  const liveByEmail = new Map<string, calendar_v3.Schema$EventAttendee>();
+  for (const a of live ?? []) if (a.email) liveByEmail.set(a.email.toLowerCase(), a);
   return attendees?.map(({ email, displayName, optional, resource }) => {
     const out: calendar_v3.Schema$EventAttendee = { email };
     if (displayName !== undefined) out.displayName = displayName;
     if (optional !== undefined) out.optional = optional;
     if (resource !== undefined) out.resource = resource;
+    const existing = liveByEmail.get(email.toLowerCase());
+    if (existing) {
+      if (existing.responseStatus != null) out.responseStatus = existing.responseStatus;
+      if (existing.comment != null) out.comment = existing.comment;
+      if (existing.additionalGuests != null) out.additionalGuests = existing.additionalGuests;
+    }
     return out;
   });
 }
@@ -287,7 +304,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     return textResult(formatEvent(res.data ));
   });
 
-  server.tool("calendar_update_event", "Update an existing calendar event", {
+  server.tool("calendar_update_event", "Update an existing calendar event. When attendees is provided, existing attendees' RSVPs (responseStatus, comment, additionalGuests) are preserved from the live event; only new attendees start with no response.", {
     calendarId: z.string(),
     eventId: z.string(),
     summary: z.string().optional(),
@@ -295,7 +312,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     end: z.string().optional().describe(`New end time (ISO 8601 datetime or date for all-day). ${ALL_DAY_END_NOTE}`),
     description: z.string().optional(),
     location: z.string().optional(),
-    attendees: z.array(attendeeSchema).optional().describe("Replaces the attendee list. To add or remove attendees, pass the list from calendar_get_event with your additions/removals."),
+    attendees: z.array(attendeeSchema).optional().describe("Replaces the attendee list. To add or remove attendees, pass the list from calendar_get_event with your additions/removals. Existing attendees' RSVPs are preserved from the live event; responseStatus/comment/additionalGuests in input are ignored."),
     timeZone: z.string().optional().describe("IANA timezone to apply to a new start/end. If omitted, the event's existing timezone is preserved."),
     sendUpdates: z.enum(["all", "externalOnly", "none"]).optional(),
     colorId: z.string().optional(),
@@ -313,7 +330,6 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     if (opts.summary !== undefined) requestBody.summary = opts.summary;
     if (opts.description !== undefined) requestBody.description = opts.description;
     if (opts.location !== undefined) requestBody.location = opts.location;
-    if (opts.attendees !== undefined) requestBody.attendees = toWritableAttendees(opts.attendees);
     if (opts.colorId !== undefined) requestBody.colorId = opts.colorId;
     if (opts.recurrence !== undefined) requestBody.recurrence = opts.recurrence;
     if (opts.reminders !== undefined) requestBody.reminders = opts.reminders;
@@ -323,23 +339,27 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     if (opts.guestsCanInviteOthers !== undefined) requestBody.guestsCanInviteOthers = opts.guestsCanInviteOthers;
     if (opts.guestsCanSeeOtherGuests !== undefined) requestBody.guestsCanSeeOtherGuests = opts.guestsCanSeeOtherGuests;
 
-    if (opts.start !== undefined || opts.end !== undefined) {
-      // Only fetch the existing event's timezone if we actually need it: a
-      // timed start/end is being changed, no explicit timeZone was given,
-      // and the datetime string itself doesn't already carry a UTC offset.
-      const needsExistingTimeZone = !opts.timeZone && (
-        (opts.start !== undefined && opts.start.includes("T") && !hasExplicitOffset(opts.start)) ||
-        (opts.end !== undefined && opts.end.includes("T") && !hasExplicitOffset(opts.end))
-      );
-      let existingTimeZone: string | undefined;
-      if (needsExistingTimeZone) {
-        const existing = await cal.events.get({
-          calendarId: opts.calendarId, eventId: opts.eventId,
-          fields: "start(timeZone),end(timeZone)",
-        });
-        existingTimeZone = existing.data.start?.timeZone || existing.data.end?.timeZone || undefined;
-      }
+    // At most one events.get per update, shared by the attendee RSVP carry-over
+    // and the existing-timezone lookup. Timezone is only needed when a timed
+    // start/end is being changed, no explicit timeZone was given, and the
+    // datetime string itself doesn't already carry a UTC offset.
+    const needsExistingTimeZone = !opts.timeZone && (
+      (opts.start !== undefined && opts.start.includes("T") && !hasExplicitOffset(opts.start)) ||
+      (opts.end !== undefined && opts.end.includes("T") && !hasExplicitOffset(opts.end))
+    );
+    const needsLiveAttendees = opts.attendees !== undefined;
+    let existing: calendar_v3.Schema$Event | undefined;
+    if (needsExistingTimeZone || needsLiveAttendees) {
+      const fields = [
+        needsLiveAttendees ? "attendees(email,responseStatus,comment,additionalGuests)" : null,
+        needsExistingTimeZone ? "start(timeZone),end(timeZone)" : null,
+      ].filter(Boolean).join(",");
+      existing = (await cal.events.get({ calendarId: opts.calendarId, eventId: opts.eventId, fields })).data;
+    }
+    if (opts.attendees !== undefined) requestBody.attendees = toWritableAttendees(opts.attendees, existing?.attendees);
+    const existingTimeZone = needsExistingTimeZone ? (existing?.start?.timeZone || existing?.end?.timeZone || undefined) : undefined;
 
+    if (opts.start !== undefined || opts.end !== undefined) {
       if (opts.start !== undefined) {
         const isAllDay = !opts.start.includes("T");
         requestBody.start = isAllDay ? { date: opts.start } : { dateTime: opts.start, timeZone: opts.timeZone || existingTimeZone };

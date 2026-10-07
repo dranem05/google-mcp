@@ -83,11 +83,12 @@ describe("calendar attendee schema (create/update)", () => {
   type Handler = (opts: Record<string, unknown>) => Promise<unknown>;
   const setup = async () => {
     const patch = vi.fn().mockResolvedValue({ data: { id: "evt1" } });
-    vi.spyOn(google, "calendar").mockReturnValue({ events: { patch } } as never);
+    const get = vi.fn().mockResolvedValue({ data: { attendees: [] } });
+    vi.spyOn(google, "calendar").mockReturnValue({ events: { patch, get } } as never);
     const tools = new Map<string, { shape: z.ZodRawShape; handler: Handler }>();
     const server = { tool: (name: string, _d: string, shape: z.ZodRawShape, handler: Handler) => { tools.set(name, { shape, handler }); } };
     registerCalendarTools(server as never, { auth: {} as never });
-    return { patch, tools };
+    return { patch, get, tools };
   };
 
   // Shape of calendar_get_event output (Google's raw attendee objects).
@@ -148,5 +149,63 @@ describe("calendar_create_event attendee forwarding", () => {
     });
     await t.handler(parsed);
     expect(insert.mock.calls[0][0].requestBody.attendees).toEqual([{ email: "b@example.com", optional: true }]);
+  });
+});
+
+describe("calendar_update_event RSVP preservation", () => {
+  type Handler = (opts: Record<string, unknown>) => Promise<unknown>;
+  const run = async (liveData: unknown, input: Record<string, unknown>) => {
+    const patch = vi.fn().mockResolvedValue({ data: { id: "evt1" } });
+    const get = vi.fn().mockResolvedValue({ data: liveData });
+    vi.spyOn(google, "calendar").mockReturnValue({ events: { patch, get } } as never);
+    const tools = new Map<string, { shape: z.ZodRawShape; handler: Handler }>();
+    registerCalendarTools({ tool: (n: string, _d: string, shape: z.ZodRawShape, handler: Handler) => { tools.set(n, { shape, handler }); } } as never, { auth: {} as never });
+    const t = tools.get("calendar_update_event")!;
+    await t.handler(z.object(t.shape).parse({ calendarId: "primary", eventId: "evt1", ...input }));
+    return { patch, get };
+  };
+
+  it("carries live responseStatus/comment/additionalGuests for existing attendees, ignoring stale input; new attendees get none", async () => {
+    const { patch } = await run(
+      { attendees: [
+        { email: "a@x.com", responseStatus: "accepted", comment: "yes", additionalGuests: 1 },
+        { email: "b@x.com", responseStatus: "declined" },
+      ] },
+      { attendees: [
+        { email: "a@x.com", responseStatus: "needsAction", comment: "stale", additionalGuests: 9 },
+        { email: "b@x.com" },
+        { email: "c@x.com", displayName: "C" },
+      ] },
+    );
+    expect(patch.mock.calls[0][0].requestBody.attendees).toEqual([
+      { email: "a@x.com", responseStatus: "accepted", comment: "yes", additionalGuests: 1 },
+      { email: "b@x.com", responseStatus: "declined" },
+      { email: "c@x.com", displayName: "C" },
+    ]);
+  });
+
+  it("matches emails case-insensitively and keeps the caller's email spelling", async () => {
+    const { patch } = await run(
+      { attendees: [{ email: "Alice@X.com", responseStatus: "tentative" }] },
+      { attendees: [{ email: "alice@x.COM" }] },
+    );
+    expect(patch.mock.calls[0][0].requestBody.attendees).toEqual([{ email: "alice@x.COM", responseStatus: "tentative" }]);
+  });
+
+  it("does not fetch the event when attendees is not provided", async () => {
+    const { patch, get } = await run({}, { summary: "new title" });
+    expect(get).not.toHaveBeenCalled();
+    expect(patch.mock.calls[0][0].requestBody).toEqual({ summary: "new title" });
+  });
+
+  it("does at most one events.get when both attendees and the timezone lookup need the event", async () => {
+    const { patch, get } = await run(
+      { attendees: [{ email: "a@x.com", responseStatus: "accepted" }], start: { timeZone: "America/New_York" } },
+      { attendees: [{ email: "a@x.com" }], start: "2026-07-06T10:00:00" },
+    );
+    expect(get).toHaveBeenCalledTimes(1);
+    const body = patch.mock.calls[0][0].requestBody;
+    expect(body.attendees).toEqual([{ email: "a@x.com", responseStatus: "accepted" }]);
+    expect(body.start).toEqual({ dateTime: "2026-07-06T10:00:00", timeZone: "America/New_York" });
   });
 });
