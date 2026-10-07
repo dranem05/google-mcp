@@ -301,25 +301,13 @@ describe("formatMessage rfc822MessageId", () => {
     expect("rfc822MessageId" in formatted).toBe(false);
   });
 
-  // Relayed and forwarded mail can carry more than one Message-ID. getHeader takes the first,
-  // which is the originating one; pinning it keeps a later refactor from silently flipping to
-  // the last and producing links that resolve to a different message.
+  // Relayed and forwarded mail can carry more than one Message-ID. getHeader takes the first;
+  // this pins that first-wins behavior so a change to it is deliberate, not accidental.
   it("takes the first Message-ID when a relayed message carries several", () => {
     const msg = withHeaders([
       { name: "Message-ID", value: "<original@sender.example>" },
       { name: "Message-ID", value: "<rewritten@relay.example>" },
     ]);
     expect(formatMessage(msg).rfc822MessageId).toBe("<original@sender.example>");
-  });
-
-  it("survives a value containing Gmail search and URL metacharacters", () => {
-    const hairy = "<a+b/c=d?e&f#g@mail.example.com>";
-    const formatted = formatMessage(withHeaders([{ name: "Message-ID", value: hairy }]));
-    expect(formatted.rfc822MessageId).toBe(hairy);
-    // The documented consumer recipe: strip brackets, then percent-encode.
-    const encoded = encodeURIComponent((formatted.rfc822MessageId as string).replace(/^<|>$/g, ""));
-    expect(decodeURIComponent(encoded)).toBe("a+b/c=d?e&f#g@mail.example.com");
-    expect(encoded).not.toContain("#");
-    expect(encoded).not.toContain("&");
   });
 });

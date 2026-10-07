@@ -51,6 +51,44 @@ const EXT_TO_MIME: Record<string, string> = {
 export const SEARCH_METADATA_HEADERS = ["From", "To", "Subject", "Date", "Message-ID"];
 export const THREAD_METADATA_HEADERS = ["From", "To", "Cc", "Date", "Subject", "Message-ID"];
 
+export type SearchHit = { id?: string | null; threadId?: string | null; snippet?: string | null; subject?: string; from?: string; date?: string; rfc822MessageId?: string };
+
+export function projectSearchHit(msg: gmail_v1.Schema$Message): SearchHit {
+  const headers = msg.payload?.headers;
+  const rfc822MessageId = getHeader(headers, "message-id");
+  return {
+    id: msg.id,
+    threadId: msg.threadId,
+    snippet: msg.snippet,
+    subject: getHeader(headers, "subject"),
+    from: getHeader(headers, "from"),
+    date: getHeader(headers, "date"),
+    ...(rfc822MessageId ? { rfc822MessageId } : {}),
+  };
+}
+
+// Per-message body snippet cap for thread reads: a whole thread can be many
+// long messages, so each is trimmed to keep the aggregate response bounded.
+const THREAD_BODY_MAX = 2000;
+export function pruneThreadMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
+  const headers = msg.payload?.headers;
+  const rfc822MessageId = getHeader(headers, "message-id");
+  const body = extractBody(msg.payload);
+  let text = body.text || (body.html ? htmlToText(body.html) : "");
+  if (text.length > THREAD_BODY_MAX) text = `${text.slice(0, THREAD_BODY_MAX)}\n\n[truncated]`;
+  return {
+    id: msg.id,
+    from: getHeader(headers, "from"),
+    to: getHeader(headers, "to"),
+    cc: getHeader(headers, "cc"),
+    date: getHeader(headers, "date"),
+    subject: getHeader(headers, "subject"),
+    // Present only when Message-ID was requested — see THREAD_METADATA_HEADERS.
+    ...(rfc822MessageId ? { rfc822MessageId } : {}),
+    body: text,
+  };
+}
+
 const attachmentSchema = z.object({
   path: z.string().optional().describe("Local filesystem path to read the attachment from"),
   content_base64: z.string().optional().describe("Base64 of the file bytes, as an alternative to path"),
@@ -114,19 +152,10 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     const ids = res.data.messages;
     const settled = await withConcurrencyLimit(ids, 5, async (m) => {
       const full = await gmail.users.messages.get({ userId: "me", id: m.id!, format: "metadata", metadataHeaders: SEARCH_METADATA_HEADERS });
-      const rfc822MessageId = getHeader(full.data.payload?.headers, "message-id");
-      return {
-        id: full.data.id,
-        threadId: full.data.threadId,
-        snippet: full.data.snippet,
-        subject: getHeader(full.data.payload?.headers, "subject"),
-        from: getHeader(full.data.payload?.headers, "from"),
-        date: getHeader(full.data.payload?.headers, "date"),
-        ...(rfc822MessageId ? { rfc822MessageId } : {}),
-      };
+      return projectSearchHit(full.data);
     });
 
-    const messages: Array<{ id?: string | null; threadId?: string | null; snippet?: string | null; subject?: string; from?: string; date?: string; rfc822MessageId?: string }> = [];
+    const messages: SearchHit[] = [];
     const failures: Array<{ id?: string | null; error: string }> = [];
     settled.forEach((result, i) => {
       if (result.status === "fulfilled") {
@@ -439,28 +468,6 @@ export function registerGmailTools(server: McpServer, ctx: ServiceContext): void
     await writeFile(path, buffer);
     return textResult({ path, size: buffer.byteLength });
   });
-
-  // Per-message body snippet cap for thread reads: a whole thread can be many
-  // long messages, so each is trimmed to keep the aggregate response bounded.
-  const THREAD_BODY_MAX = 2000;
-  function pruneThreadMessage(msg: gmail_v1.Schema$Message): Record<string, unknown> {
-    const headers = msg.payload?.headers;
-    const rfc822MessageId = getHeader(headers, "message-id");
-    const body = extractBody(msg.payload);
-    let text = body.text || (body.html ? htmlToText(body.html) : "");
-    if (text.length > THREAD_BODY_MAX) text = `${text.slice(0, THREAD_BODY_MAX)}\n\n[truncated]`;
-    return {
-      id: msg.id,
-      from: getHeader(headers, "from"),
-      to: getHeader(headers, "to"),
-      cc: getHeader(headers, "cc"),
-      date: getHeader(headers, "date"),
-      subject: getHeader(headers, "subject"),
-      // Present only when Message-ID was requested — see THREAD_METADATA_HEADERS.
-      ...(rfc822MessageId ? { rfc822MessageId } : {}),
-      body: text,
-    };
-  }
 
   server.tool("gmail_read_thread", "Read an entire email thread (conversation) at once — every message's headers and a trimmed body — given a thread id, each with its `rfc822MessageId`. Use this instead of gmail_read_email when you need the full back-and-forth context of a conversation.", {
     threadId: z.string().describe("Gmail thread id (the threadId field on any message in the thread)"),
