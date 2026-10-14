@@ -277,6 +277,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     guestsCanModify: z.boolean().optional(),
     guestsCanInviteOthers: z.boolean().optional(),
     guestsCanSeeOtherGuests: z.boolean().optional(),
+    removeConference: z.boolean().optional().describe("true removes the event's conference (e.g. the Google Meet link). To add one, use calendar_add_meet_link. false/omitted leaves the conference untouched."),
   }, async (opts) => {
     const cal = api;
     const requestBody: calendar_v3.Schema$Event = {};
@@ -293,6 +294,9 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
     if (opts.guestsCanModify !== undefined) requestBody.guestsCanModify = opts.guestsCanModify;
     if (opts.guestsCanInviteOthers !== undefined) requestBody.guestsCanInviteOthers = opts.guestsCanInviteOthers;
     if (opts.guestsCanSeeOtherGuests !== undefined) requestBody.guestsCanSeeOtherGuests = opts.guestsCanSeeOtherGuests;
+    // patch merges, so an explicit null is what clears the field; the API
+    // ignores conferenceData changes unless conferenceDataVersion is 1.
+    if (opts.removeConference) requestBody.conferenceData = null as unknown as undefined;
 
     if (opts.start !== undefined || opts.end !== undefined) {
       // Only fetch the existing event's timezone if we actually need it: a
@@ -323,6 +327,7 @@ export function registerCalendarTools(server: McpServer, ctx: ServiceContext): v
 
     const res = await cal.events.patch({
       calendarId: opts.calendarId, eventId: opts.eventId,
+      conferenceDataVersion: opts.removeConference ? 1 : undefined,
       sendUpdates: opts.sendUpdates,
       requestBody,
     });
