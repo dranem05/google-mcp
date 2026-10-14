@@ -727,6 +727,20 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult(res.data);
   });
 
+  server.tool("docs_edit_reply", "Edit an existing reply to a comment", {
+    documentId: z.string(),
+    commentId: z.string(),
+    replyId: z.string(),
+    content: z.string(),
+  }, async ({ documentId, commentId, replyId, content }) => {
+    const res = await driveApi.replies.update({
+      fileId: documentId, commentId, replyId,
+      fields: "id,content,author,modifiedTime",
+      requestBody: { content },
+    });
+    return textResult(res.data);
+  });
+
   server.tool("docs_resolve_comment", "Resolve a comment", {
     documentId: z.string(),
     commentId: z.string(),
