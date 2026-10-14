@@ -730,13 +730,21 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
   server.tool("docs_resolve_comment", "Resolve a comment", {
     documentId: z.string(),
     commentId: z.string(),
-  }, async ({ documentId, commentId }) => {
-    const res = await driveApi.comments.update({
-      fileId: documentId, commentId,
-      fields: "id,resolved",
-      requestBody: { resolved: true },
+    content: z.string().optional().describe("Optional closing note to attach to the resolving reply"),
+  }, async ({ documentId, commentId, content }) => {
+    // The Drive API has no "resolve" verb on comments.update — comments.update
+    // requires reply content and never sets `resolved`. Resolving is done by
+    // creating a reply with action: "resolve".
+    const res = await driveApi.replies.create({
+      fileId: documentId,
+      commentId,
+      fields: "id,action,author,createdTime",
+      requestBody: {
+        action: "resolve",
+        ...(content !== undefined ? { content } : {}),
+      },
     });
-    return textResult({ commentId, resolved: true });
+    return textResult({ commentId, resolved: res.data.action === "resolve", replyId: res.data.id });
   });
 
   server.tool("docs_delete_comment", "Delete a comment", {
