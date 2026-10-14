@@ -142,11 +142,12 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     title: z.string(),
     rowCount: z.number().optional(),
     columnCount: z.number().optional(),
-  }, async ({ spreadsheetId, title, rowCount, columnCount }) => {
+    index: z.number().int().min(0).optional().describe("Zero-based position of the new tab (default: appended at the end)"),
+  }, async ({ spreadsheetId, title, rowCount, columnCount, index }) => {
     const res = await api.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
-        requests: [{ addSheet: { properties: { title, gridProperties: { rowCount: rowCount || 1000, columnCount: columnCount || 26 } } } }],
+        requests: [{ addSheet: { properties: { title, ...(index !== undefined && { index }), gridProperties: { rowCount: rowCount || 1000, columnCount: columnCount || 26 } } } }],
       },
     });
     const sheet = res.data.replies?.[0]?.addSheet;
@@ -265,6 +266,8 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     fontSize: z.number().optional(),
     backgroundColor: z.object({ red: z.number(), green: z.number(), blue: z.number() }).optional(),
     horizontalAlignment: z.enum(["LEFT", "CENTER", "RIGHT"]).optional(),
+    verticalAlignment: z.enum(["TOP", "MIDDLE", "BOTTOM"]).optional(),
+    wrapStrategy: z.enum(["OVERFLOW_CELL", "LEGACY_WRAP", "CLIP", "WRAP"]).optional(),
     numberFormat: z.object({ type: z.string(), pattern: z.string() }).optional(),
   }, async (opts) => {
     const format: Record<string, unknown> = {};
@@ -284,6 +287,14 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     if (opts.horizontalAlignment) {
       format.horizontalAlignment = opts.horizontalAlignment;
       fields.push("userEnteredFormat.horizontalAlignment");
+    }
+    if (opts.verticalAlignment) {
+      format.verticalAlignment = opts.verticalAlignment;
+      fields.push("userEnteredFormat.verticalAlignment");
+    }
+    if (opts.wrapStrategy) {
+      format.wrapStrategy = opts.wrapStrategy;
+      fields.push("userEnteredFormat.wrapStrategy");
     }
     if (opts.numberFormat) {
       format.numberFormat = opts.numberFormat;
