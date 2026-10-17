@@ -33,6 +33,15 @@ function columnLettersToIndex(letters: string): number {
   return result - 1; // convert to zero-based
 }
 
+/** Converts a zero-based column index to A1 letters (0 -> "A", 26 -> "AA"). */
+export function columnIndexToLetters(index: number): string {
+  let letters = "";
+  for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) {
+    letters = String.fromCharCode(65 + ((n - 1) % 26)) + letters;
+  }
+  return letters;
+}
+
 function unquoteSheetName(raw: string): string {
   if (raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'")) {
     return raw.slice(1, -1).replace(/''/g, "'");

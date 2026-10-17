@@ -41,7 +41,7 @@ MY_TOKEN_VAR=ya29...       google-mcp --access-token-env MY_TOKEN_VAR
 | Meet | `meet_*` | Create standalone Meet spaces, list conference records, fetch transcripts |
 | Drive | `drive_*` | List/search/move/copy/rename/delete, folder management, download/upload, sharing and permissions |
 | Docs | `docs_*` | Read/write Google Docs (native markdown in/out), text styling, tables, tabs, comments |
-| Sheets | `sheets_*` | Read/write values (single, batch, append), sheet/tab management, formatting, borders/merges, charts, find/replace, named ranges |
+| Sheets | `sheets_*` | Read/write values (single, batch, append), sheet/tab management, formatting, borders/merges, charts, find/replace, named ranges, cell notes (set/append/clear/read) |
 | Slides | `slides_*` | Create/edit presentations, slides, text/shapes/images, styling, PDF export, thumbnails |
 
 By default every family registers. `--families gmail,calendar` restricts the server to just the listed families (valid names: `gmail`, `calendar`, `meet`, `drive`, `docs`, `sheets`, `slides`); an unknown name fails startup with an error listing the valid ones. Works in both auth modes.

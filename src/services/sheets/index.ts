@@ -14,6 +14,18 @@ import {
   gridRangeFromA1,
   type BorderSide,
 } from "./builders.js";
+import {
+  noteTextSchema,
+  assertBoundedRange,
+  buildSetNoteRequest,
+  buildClearNoteRequest,
+  buildAppendNoteRequest,
+  assertAppendRangeWithinCap,
+  assertNoteCountWithinCap,
+  collectNotes,
+  listNotes,
+  type BoundedGridRange,
+} from "./notes.js";
 
 export function registerSheetsTools(server: McpServer, ctx: ServiceContext): void {
   const api = google.sheets({ version: "v4", auth: ctx.auth });
@@ -692,6 +704,67 @@ export function registerSheetsTools(server: McpServer, ctx: ServiceContext): voi
     });
     const nr = res.data.replies?.[0]?.addNamedRange?.namedRange;
     return textResult({ namedRangeId: nr?.namedRangeId, name: nr?.name, range: nr?.range });
+  });
+
+  /** Range params shared by the sheets_*_note tools. */
+  const noteRangeParams = {
+    spreadsheetId: z.string(),
+    range: z.string().describe("A1 cell or bounded range (e.g. 'Sheet1!B2' or \"'My Sheet'!B2:C3\")"),
+    sheetId: z.number().optional().describe("Sheet id, if the range isn't sheet-qualified"),
+  };
+
+  /** Resolves the shared note-tool range params to a GridRange bounded on every side. */
+  async function resolveNoteRange(spreadsheetId: string, range: string, sheetId?: number): Promise<BoundedGridRange> {
+    return assertBoundedRange(await resolveGridRange(spreadsheetId, range, sheetId));
+  }
+
+  /** Fetches only the notes in a bounded range, plus the title of its sheet. */
+  async function fetchNotes(spreadsheetId: string, range: BoundedGridRange) {
+    const res = await api.spreadsheets.getByDataFilter({
+      spreadsheetId,
+      fields: "sheets(properties(sheetId,title),data(startRow,startColumn,rowData(values(note))))",
+      requestBody: { dataFilters: [{ gridRange: range }], includeGridData: true },
+    });
+    const sheet = res.data.sheets?.find((s) => s.properties?.sheetId === range.sheetId);
+    return { title: sheet?.properties?.title ?? "", notes: collectNotes(sheet?.data, range) };
+  }
+
+  server.tool("sheets_set_note", "Set the note (the plain-text annotation shown on hover; not a threaded comment) on every cell in a cell or range, replacing any existing note. Pass a sheet-qualified A1 range (e.g. 'My Sheet'!B2:C3) or an A1 range plus sheetId; whole rows/columns are rejected. Empty text is an error, not a delete: use sheets_clear_note to remove notes.", {
+    ...noteRangeParams,
+    note: noteTextSchema.describe("Note text (must not be empty)"),
+  }, async ({ spreadsheetId, range, sheetId, note }) => {
+    const gridRange = await resolveNoteRange(spreadsheetId, range, sheetId);
+    await api.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [buildSetNoteRequest(gridRange, note)] } });
+    return textResult({ success: true });
+  });
+
+  server.tool("sheets_append_note", "Append text to the note on every cell in a cell or range (at most 10,000 cells), on a new line after that cell's existing note; a cell with no note just gets the text. Notes are read then rewritten, so a note edited by someone else in between is overwritten. Pass a sheet-qualified A1 range or an A1 range plus sheetId; whole rows/columns are rejected. Empty text is an error.", {
+    ...noteRangeParams,
+    note: noteTextSchema.describe("Text to append (must not be empty)"),
+  }, async ({ spreadsheetId, range, sheetId, note }) => {
+    const gridRange = await resolveNoteRange(spreadsheetId, range, sheetId);
+    assertAppendRangeWithinCap(gridRange, range);
+    // Read-modify-write: a note changed by someone else between these two calls is overwritten.
+    const { notes } = await fetchNotes(spreadsheetId, gridRange);
+    await api.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [buildAppendNoteRequest(gridRange, notes, note)] } });
+    return textResult({ success: true });
+  });
+
+  server.tool("sheets_clear_note", "Remove the note from every cell in a cell or range. Values and formatting are untouched. Pass a sheet-qualified A1 range or an A1 range plus sheetId; whole rows/columns are rejected.", {
+    ...noteRangeParams,
+  }, async ({ spreadsheetId, range, sheetId }) => {
+    const gridRange = await resolveNoteRange(spreadsheetId, range, sheetId);
+    await api.spreadsheets.batchUpdate({ spreadsheetId, requestBody: { requests: [buildClearNoteRequest(gridRange)] } });
+    return textResult({ success: true });
+  });
+
+  server.tool("sheets_read_notes", "List the notes in a cell or range as {cell, note} pairs, where cell is sheet-qualified A1. Only cells that have a note are included (at most 10,000); an empty list means none. Pass a sheet-qualified A1 range or an A1 range plus sheetId; whole rows/columns are rejected.", {
+    ...noteRangeParams,
+  }, async ({ spreadsheetId, range, sheetId }) => {
+    const gridRange = await resolveNoteRange(spreadsheetId, range, sheetId);
+    const { title, notes } = await fetchNotes(spreadsheetId, gridRange);
+    assertNoteCountWithinCap(notes.length, range);
+    return textResult({ notes: listNotes(notes, title) });
   });
 
   server.tool("sheets_list_named_ranges", "List the named ranges defined in a spreadsheet (id, name, and grid range).", {

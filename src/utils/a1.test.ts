@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseA1Range } from "./a1.js";
+import { columnIndexToLetters, parseA1Range } from "./a1.js";
 
 describe("parseA1Range", () => {
   it("parses a sheet-qualified bounded range", () => {
@@ -92,5 +92,23 @@ describe("parseA1Range", () => {
 
   it("throws on a reference with no column letters", () => {
     expect(() => parseA1Range("Sheet1!1:5")).toThrow();
+  });
+});
+
+describe("columnIndexToLetters", () => {
+  it.each([
+    [0, "A"],
+    [25, "Z"],
+    [26, "AA"],
+    [701, "ZZ"],
+    [702, "AAA"],
+  ])("maps %i to %s", (index, letters) => {
+    expect(columnIndexToLetters(index)).toBe(letters);
+  });
+
+  it("round-trips through parseA1Range", () => {
+    for (const index of [0, 1, 25, 26, 51, 52, 701, 702, 16383]) {
+      expect(parseA1Range(`${columnIndexToLetters(index)}1`).startColumnIndex).toBe(index);
+    }
   });
 });
