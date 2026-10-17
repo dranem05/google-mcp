@@ -262,12 +262,16 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     return textResult({ success: true, note: "Appended as native Docs content. Full-document re-import: comments/anchors in existing content may not survive." });
   });
 
-  server.tool("docs_modify_text", "Replace text in a range", {
+  server.tool("docs_modify_text", "Replace text in a range with newText. To delete a range without inserting anything, use docs_delete_text.", {
     documentId: z.string(),
     startIndex: z.number(),
     endIndex: z.number(),
-    newText: z.string(),
+    newText: z.string().describe("Replacement text; must be non-empty (use docs_delete_text to delete)"),
   }, async ({ documentId, startIndex, endIndex, newText }) => {
+    // Docs rejects an empty insertText with an error that doesn't point at the fix.
+    if (newText === "") {
+      throw new Error("newText is empty. To delete a range without inserting text, use docs_delete_text.");
+    }
     await docsApi.documents.batchUpdate({
       documentId,
       requestBody: {
@@ -276,6 +280,18 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
           { insertText: { text: newText, location: { index: startIndex } } },
         ],
       },
+    });
+    return textResult({ success: true });
+  });
+
+  server.tool("docs_delete_text", "Delete the content in a range (startIndex inclusive, endIndex exclusive). Content after the range shifts left by endIndex - startIndex.", {
+    documentId: z.string(),
+    startIndex: z.number(),
+    endIndex: z.number(),
+  }, async ({ documentId, startIndex, endIndex }) => {
+    await docsApi.documents.batchUpdate({
+      documentId,
+      requestBody: { requests: [{ deleteContentRange: { range: { startIndex, endIndex } } }] },
     });
     return textResult({ success: true });
   });
@@ -537,8 +553,15 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     fontSize: z.number().optional().describe("Font size in points"),
     fontFamily: z.string().optional(),
     foregroundColor: z.object({ red: z.number(), green: z.number(), blue: z.number() }).optional(),
-    link: z.string().optional().describe("URL to link to"),
-  }, async ({ documentId, startIndex, endIndex, bold, italic, underline, strikethrough, fontSize, fontFamily, foregroundColor, link }) => {
+    link: z.string().optional().describe("URL to link to (non-empty; to remove a link use removeLink)"),
+    removeLink: z.boolean().optional().describe("Set true to remove any link from the range. The text stays; Docs also clears its underline and text color unless they are set in the same call. Cannot be combined with link."),
+  }, async ({ documentId, startIndex, endIndex, bold, italic, underline, strikethrough, fontSize, fontFamily, foregroundColor, link, removeLink }) => {
+    if (removeLink && link !== undefined) {
+      throw new Error("Pass either link (to set a link) or removeLink: true (to remove one), not both.");
+    }
+    if (link !== undefined && link.trim() === "") {
+      throw new Error("link is empty. To remove a link, pass removeLink: true instead.");
+    }
     const textStyle: Record<string, unknown> = {};
     const fields: string[] = [];
     if (bold !== undefined) { textStyle.bold = bold; fields.push("bold"); }
@@ -549,6 +572,8 @@ export function registerDocsTools(server: McpServer, ctx: ServiceContext): void 
     if (fontFamily) { textStyle.weightedFontFamily = { fontFamily }; fields.push("weightedFontFamily"); }
     if (foregroundColor) { textStyle.foregroundColor = { color: { rgbColor: foregroundColor } }; fields.push("foregroundColor"); }
     if (link) { textStyle.link = { url: link }; fields.push("link"); }
+    // A field named in the mask but absent from textStyle is reset, which clears the link.
+    if (removeLink) fields.push("link");
 
     await docsApi.documents.batchUpdate({
       documentId,
