@@ -366,9 +366,9 @@ describe("htmlToText", () => {
       .toBe("Follow us <https://a.example/> <https://b.example/> today");
   });
 
-  it("drops fragment, script, and relative link targets but keeps their text", () => {
+  it("shows fragment, script, and relative link targets as written", () => {
     expect(htmlToText('<a href="#top">Top</a> <a href="javascript:void(0)">Menu</a> <a href="/local">Here</a>'))
-      .toBe("Top Menu Here");
+      .toBe("Top <#top> Menu <javascript:void(0)> Here </local>");
   });
 
   it("reads the href attribute, not a *-href attribute before it", () => {
@@ -532,6 +532,109 @@ describe("htmlToText", () => {
     expect(htmlToText('<a href="mailto:help@example.com?subject=Hi">Contact support</a>'))
       .toBe("Contact support <help@example.com>");
     expect(htmlToText('<a href="mailto:help@example.com">help@example.com</a>')).toBe("help@example.com <help@example.com>");
+  });
+});
+
+describe("htmlToText targets that are relative or not web links", () => {
+  const spoof = '<a href="login">https://chase.com/login</a>';
+
+  it("shows a relative target as written when there is no <base>", () => {
+    expect(htmlToText(spoof)).toBe("https://chase.com/login <login>");
+    expect(htmlToText('<a href="../reset?u=1">Reset</a>')).toBe("Reset <../reset?u=1>");
+    expect(htmlToText('<a href="chase.com/login">Sign in</a>')).toBe("Sign in <chase.com/login>");
+  });
+
+  it("resolves a relative target against the <base>, which is where a client that honors it goes", () => {
+    expect(htmlToText(`<head><base href="https://evil.example/"></head><body>${spoof}</body>`))
+      .toBe("https://chase.com/login <https://evil.example/login>");
+    expect(htmlToText('<base href="https://evil.example/a/b"><a href="../x">X</a> <a href="/y">Y</a> <a href="?q=1">Q</a>'))
+      .toBe("X <https://evil.example/x> Y <https://evil.example/y> Q <https://evil.example/a/b?q=1>");
+  });
+
+  it("applies a <base> that comes after the link, as a browser does", () => {
+    expect(htmlToText(`${spoof}<base href="https://evil.example/">`))
+      .toBe("https://chase.com/login <https://evil.example/login>");
+  });
+
+  it("uses only the first <base> with an href, and none at all if that one is not absolute", () => {
+    expect(htmlToText(`<base target="_blank"><base href="https://evil.example/"><base href="https://chase.com/">${spoof}`))
+      .toBe("https://chase.com/login <https://evil.example/login>");
+    expect(htmlToText(`<base href="/relative/"><base href="https://evil.example/">${spoof}`))
+      .toBe("https://chase.com/login <login>");
+  });
+
+  it("ignores an SVG <base> and one inside a <template>, which set no document base", () => {
+    expect(htmlToText(`<svg><base href="https://evil.example/"></base></svg>${spoof}`)).toBe("https://chase.com/login <login>");
+    expect(htmlToText(`<template><base href="https://evil.example/"></template>${spoof}`)).toBe("https://chase.com/login <login>");
+  });
+
+  it("resolves fragment-only, scheme-relative and empty hrefs against the <base>", () => {
+    const base = '<base href="http://evil.example/p">';
+    expect(htmlToText(`${base}<a href="#top">Top</a>`)).toBe("Top <http://evil.example/p#top>");
+    expect(htmlToText(`${base}<a href="//cdn.example/x">CDN</a>`)).toBe("CDN <http://cdn.example/x>");
+    expect(htmlToText(`${base}<a href="">Home</a> <a href="  ">Blank</a>`))
+      .toBe("Home <http://evil.example/p> Blank <http://evil.example/p>");
+  });
+
+  it("shows both readings of a same-scheme href with no slashes: against the <base>, and without it", () => {
+    const base = '<base href="https://evil.example/">';
+    expect(htmlToText(`${base}<a href="https:chase.com/login">https://chase.com/login</a>`))
+      .toBe("https://chase.com/login <https://evil.example/chase.com/login> or <https://chase.com/login>");
+    expect(htmlToText(`${base}<a href="HTTPS:/chase.com/login">Sign in</a>`))
+      .toBe("Sign in <https://evil.example/chase.com/login> or <https://chase.com/login>");
+    expect(htmlToText('<base href="https://bank.example/"><a href="https:evil.test">Pay</a>'))
+      .toBe("Pay <https://bank.example/evil.test> or <https://evil.test/>");
+    expect(htmlToText('<base href="http://evil.example/"><a href="http:chase.com">Go</a><br><a href="http:chase.com"><img></a>'))
+      .toBe("Go <http://evil.example/chase.com> or <http://chase.com/>\n<http://evil.example/chase.com> or <http://chase.com/>");
+    expect(htmlToText(`${base}<a href="http:chase.com/x">Go</a>`)).toBe("Go <http://chase.com/x>");
+  });
+
+  it("shows nothing for an empty href when there is no <base>", () => {
+    expect(htmlToText('<a href="">Home</a> <a href=" \t ">Blank</a>')).toBe("Home Blank");
+  });
+
+  it("shows a relative target as written when it cannot be resolved against the <base>", () => {
+    expect(htmlToText(`<base href="mailto:help@example.com">${spoof}`)).toBe("https://chase.com/login <login>");
+  });
+
+  it("shows script and other non-web targets as written, and a data: URL's header only", () => {
+    expect(htmlToText('<a href="javascript:location=\'https://evil.example/\'">https://chase.com/</a>'))
+      .toBe("https://chase.com/ <javascript:location='https://evil.example/'>");
+    expect(htmlToText('<a href="JavaScript:alert(1)">Go</a>')).toBe("Go <javascript:alert(1)>");
+    expect(htmlToText('<a href="java\tscript:alert(1)">Go</a>')).toBe("Go <javascript:alert(1)>");
+    expect(htmlToText('<a href="ms-word:ofe|u|https://evil.example/a.docx">Open</a>'))
+      .toBe("Open <ms-word:ofe|u|https://evil.example/a.docx>");
+    expect(htmlToText(`<a href="data:text/html;base64,${"A".repeat(5000)}">https://chase.com/</a>`))
+      .toBe("https://chase.com/ <data:text/html;base64,\u2026>");
+    expect(htmlToText(`<a href="DATA:text/plain,${"\u00e9".repeat(150)}">X</a>`)).toBe("X <data:text/plain,\u2026>");
+    expect(htmlToText('<a href="data:,">X</a>')).toBe("X <data:,>");
+  });
+
+  it("shows a long non-web target in full, so a host late in it stays visible", () => {
+    const handler = `ms-word:ofe|u|https://chase.com.${"a".repeat(300)}.evil.example/a.docx`;
+    expect(htmlToText(`<a href="${handler}">Open statement</a>`)).toBe(`Open statement <${handler}>`);
+  });
+
+  it("drops a user:password part from a non-web target, which only disguises the host", () => {
+    expect(htmlToText('<a href="ftp://chase.com@evil.example/f">Files</a>')).toBe("Files <ftp://evil.example/f>");
+  });
+
+  it("keeps a written-out target from breaking out of its brackets or hiding characters", () => {
+    expect(htmlToText('<a href="a>b <c\u202Ed">X</a>')).toBe("X <a%3Eb%20%3Cc%E2%80%AEd>");
+    expect(htmlToText('<a href="javascript:a>b">X</a>')).toBe("X <javascript:a%3Eb>");
+  });
+
+  it("leaves absolute web, mail and phone targets as they were, with or without a <base>", () => {
+    const links = '<a href="https://chase.com/login">Sign in</a> <a href="mailto:help@chase.com">Mail</a> <a href="tel:+15550100">Call</a> <a href="//cdn.example/x">CDN</a>';
+    const expected = "Sign in <https://chase.com/login> Mail <help@chase.com> Call <+15550100> CDN <https://cdn.example/x>";
+    expect(htmlToText(links)).toBe(expected);
+    expect(htmlToText(`<base href="https://evil.example/">${links}`))
+      .toBe(expected);
+  });
+
+  it("does not add targets to outgoing text", () => {
+    expect(htmlToOutgoingText(`<base href="https://evil.example/">${spoof} <a href="javascript:x">Go</a>`))
+      .toBe("https://chase.com/login Go");
   });
 });
 

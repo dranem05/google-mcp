@@ -1,5 +1,5 @@
 import { gmail_v1 } from "googleapis";
-import { defaultTreeAdapter, parse, type DefaultTreeAdapterMap, type DefaultTreeAdapterTypes, type TreeAdapter } from "parse5";
+import { defaultTreeAdapter, html as parse5Html, parse, type DefaultTreeAdapterMap, type DefaultTreeAdapterTypes, type TreeAdapter } from "parse5";
 
 /** Decodes a Gmail base64url string to raw bytes (safe for binary content like attachments). */
 export function decodeBase64UrlToBuffer(data: string): Buffer {
@@ -443,7 +443,11 @@ const BLOCK_ELEMENTS = new Set([
 /** Elements whose text keeps its whitespace and line breaks. */
 const PREFORMATTED_ELEMENTS = new Set(["pre", "listing", "plaintext", "xmp", "textarea"]);
 
-/** Link schemes worth showing outside the page; anything else (javascript:, data:, …) is dropped. */
+/**
+ * Link schemes shown in their readable form: URLs as a browser loads them,
+ * addresses and numbers bare. Any other target (javascript:, data:, an app
+ * handler, or a relative href with no usable <base>) is shown as written.
+ */
 const LINK_SCHEMES = new Set(["http:", "https:", "webcal:", "mailto:", "tel:", "sms:"]);
 
 /**
@@ -515,28 +519,31 @@ function mailtoRecipients(url: URL): string | undefined {
 }
 
 /**
- * Where a link goes, as shown after its text: the href resolved the way a
- * browser resolves it (WHATWG URL parsing, so `https:host`, backslashes and
- * entity-encoded schemes reach their real destination), restricted to
- * LINK_SCHEMES. A scheme-relative `//host/path` is taken as https; relative
- * paths and fragments have no meaning outside the page and are dropped.
- * Addresses and numbers are shown bare; URLs as the browser would load them,
- * minus any `user:password@` part, which only serves to make a link to one
- * host read like another (`https://bank.example@evil.test/`).
+ * A target shown as written, display-safe. A data: URL carries content rather
+ * than a destination and can run to megabytes, so only its header (media type
+ * and encoding, up to the comma) is shown, with an ellipsis for the payload.
+ * Every other target is shown in full, since a host can sit anywhere in it.
  */
-function linkTarget(href: string): string | undefined {
-  let url: URL;
-  try {
-    url = new URL(href);
-  } catch {
-    if (!/^[\u0000-\u0020]*[\\/]{2}/.test(href.replace(/[\t\n\r]/g, ""))) return undefined;
-    try {
-      url = new URL(href, "https://scheme-relative.invalid/");
-    } catch {
-      return undefined;
+function rawTarget(s: string): string {
+  const header = /^data:[^,]*,(?=.)/is.exec(s);
+  return header ? `${displaySafe(header[0])}\u2026` : displaySafe(s);
+}
+
+/**
+ * A parsed link target in its shown form: outside LINK_SCHEMES as written
+ * (rawTarget); addresses and numbers bare; URLs as the browser would load
+ * them. Any `user:password@` part is dropped, since it only serves to make a
+ * link to one host read like another (`https://bank.example@evil.test/`).
+ * A mailto with no recipient (only a subject, say) has none.
+ */
+function shownTarget(url: URL): string | undefined {
+  if (!LINK_SCHEMES.has(url.protocol)) {
+    if (url.host) {
+      url.username = "";
+      url.password = "";
     }
+    return rawTarget(url.href);
   }
-  if (!LINK_SCHEMES.has(url.protocol)) return undefined;
   if (url.protocol === "mailto:") return mailtoRecipients(url);
   if (url.protocol === "tel:" || url.protocol === "sms:") return displayDecoded(opaqueBody(url), true) || undefined;
   url.username = "";
@@ -544,6 +551,46 @@ function linkTarget(href: string): string | undefined {
   // Special schemes (http, https) are already serialized percent-encoded; an
   // opaque webcal: URL is not.
   return displaySafe(url.href);
+}
+
+/**
+ * Where a link goes, bracketed, as shown after its text so the reader can
+ * compare the two: link text can imitate any URL. The href is resolved the
+ * way a browser resolves it (WHATWG URL parsing, so `https:host`, backslashes
+ * and entity-encoded schemes reach their real destination), against the
+ * document's <base> when it has one, since a client that honors <base> sends
+ * relative, fragment-only and empty hrefs there. A same-scheme `https:host`
+ * is relative to an https <base> but absolute to a client that ignores it, so
+ * when the two readings differ both are shown: `<base reading> or <other>`.
+ * With no <base>, a scheme-relative `//host/path` is taken as https and any
+ * other relative href is shown as written. An empty href with no <base>
+ * points back at the message itself and gets no target.
+ */
+function linkTarget(href: string, base: URL | undefined): string | undefined {
+  // What the URL parser ignores: tabs and newlines anywhere, controls and spaces at the ends.
+  const written = href.replace(/[\t\n\r]/g, "").replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, "");
+  let url: URL;
+  try {
+    url = base ? new URL(written, base) : new URL(written);
+  } catch {
+    if (base || !/^[\\/]{2}/.test(written)) return written ? `<${rawTarget(written)}>` : undefined;
+    try {
+      url = new URL(written, "https://scheme-relative.invalid/");
+    } catch {
+      return `<${rawTarget(written)}>`;
+    }
+  }
+  const shown = shownTarget(url);
+  let alone: string | undefined;
+  if (base) {
+    try {
+      alone = shownTarget(new URL(written));
+    } catch {
+      // Relative without the base: it reaches no other destination.
+    }
+  }
+  const targets = [...new Set([shown, alone].filter((t) => t !== undefined))];
+  return targets.length ? targets.map((t) => `<${t}>`).join(" or ") : undefined;
 }
 
 /**
@@ -852,6 +899,34 @@ function renderDoc(doc: DefaultTreeAdapterTypes.Document, linkTargets: boolean):
   }
 }
 
+/**
+ * The document's base URL, as a browser sets it: the href of the first HTML
+ * <base> element that has one, in tree order wherever it sits, if that href
+ * is an absolute URL. A message has no URL of its own, so a relative or
+ * unparsable first href leaves no base, and later <base> elements never count.
+ * Template contents are not in the tree, so a <base> there is skipped too.
+ */
+function documentBase(doc: DefaultTreeAdapterTypes.Document): URL | undefined {
+  const stack: DefaultTreeAdapterTypes.Node[] = [doc];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (isElement(node) && node.tagName === "base" && node.namespaceURI === parse5Html.NS.HTML) {
+      const href = node.attrs.find((a) => a.name === "href" && !a.namespace);
+      if (href) {
+        try {
+          return new URL(href.value);
+        } catch {
+          return undefined;
+        }
+      }
+    }
+    if (!("childNodes" in node)) continue;
+    const children = node.childNodes;
+    for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+  }
+  return undefined;
+}
+
 /** A link's href: the plain `href` (what HTML and SVG 2 follow), else SVG's `xlink:href`. */
 function hrefOf(element: ParsedElement): string | undefined {
   return (element.attrs.find((a) => a.name === "href" && !a.namespace) ?? element.attrs.find((a) => a.name === "href"))?.value;
@@ -867,7 +942,8 @@ function hrefOf(element: ParsedElement): string | undefined {
  * text/plain-versus-HTML comparison in bestBodyText.
  *
  * With `linkTargets`, each link (`<a>`, or an image-map `<area>` with its
- * alt text as the link text) with a target from linkTarget is followed by
+ * alt text as the link text) with a target from linkTarget (every non-empty
+ * href has one, and an empty href under a <base> does too) is followed by
  * ` <target>`, or is just `<target>` when it has no text, however its text
  * reads: the href is where the link goes, and link text can imitate any URL.
  *
@@ -875,6 +951,7 @@ function hrefOf(element: ParsedElement): string | undefined {
  */
 function walkToText(doc: DefaultTreeAdapterTypes.Document, linkTargets: boolean): string {
   const sink = new TextSink();
+  const base = linkTargets ? documentBase(doc) : undefined;
   type Step = { node: DefaultTreeAdapterTypes.Node; index: number; exit?: () => void };
   const stack: Step[] = [{ node: doc, index: 0 }];
   let preDepth = 0;
@@ -901,15 +978,15 @@ function walkToText(doc: DefaultTreeAdapterTypes.Document, linkTargets: boolean)
         continue;
       }
       const href = tag === "a" || tag === "area" ? hrefOf(node) : undefined;
-      const target = linkTargets && href !== undefined ? linkTarget(href) : undefined;
+      const target = linkTargets && href !== undefined ? linkTarget(href, base) : undefined;
       if (tag === "area") {
         const alt = (node.attrs.find((a) => a.name === "alt")?.value ?? "").replace(/[\t\n\f\r \xA0]+/g, " ").trim();
         if (target !== undefined && alt) {
           sink.text(` ${alt}`);
-          sink.trailer(`<${target}>`);
+          sink.trailer(target);
           sink.space();
         } else if (target !== undefined) {
-          sink.text(` <${target}> `);
+          sink.text(` ${target} `);
         }
         continue;
       }
@@ -926,8 +1003,8 @@ function walkToText(doc: DefaultTreeAdapterTypes.Document, linkTargets: boolean)
       if (target !== undefined) {
         const visibleBefore = sink.visible;
         exits.push(() => {
-          if (sink.visible > visibleBefore) sink.trailer(`<${target}>`);
-          else sink.text(` <${target}> `);
+          if (sink.visible > visibleBefore) sink.trailer(target);
+          else sink.text(` ${target} `);
         });
       }
     }
